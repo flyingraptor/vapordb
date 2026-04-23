@@ -1,6 +1,6 @@
 # vapordb
 
-In-memory SQL database for Go. No setup, no schema, just queries.
+In-memory SQL database for fast prototyping in Go - no setup, no schema, just queries
 
 When building something new, the data model changes constantly. With a real database every field addition, rename, or type change requires a migration script, an ALTER TABLE, and a re-run of your seed data. That friction compounds quickly and slows you down at exactly the stage where you need to move fast.
 
