@@ -1,0 +1,16 @@
+# binaries
+/vapordb
+/cmd/playground/playground
+
+# data files — don't commit persistent state
+cmd/playground/data.json
+
+# Go build cache
+*.test
+*.out
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
