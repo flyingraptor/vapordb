@@ -1,6 +1,7 @@
 package vapordb
 
 import (
+	"encoding"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -92,10 +93,30 @@ func ScanRows[T any](rows []Row) []T {
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
-var timeType = reflect.TypeOf(time.Time{})
+var (
+	timeType         = reflect.TypeOf(time.Time{})
+	stringerType     = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
+	textUnmarshaller = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+)
 
+// structFieldToSQL converts a struct field value into its SQL literal.
+// Resolution order:
+//  1. Nil pointer  → NULL
+//  2. Pointer      → dereference and recurse
+//  3. time.Time    → DATE('…')
+//  4. fmt.Stringer → quoted String() result
+//  5. Primitive kinds (string, int, float, bool)
+//  6. Anything else → NULL
 func structFieldToSQL(v reflect.Value) string {
-	// Handle time.Time before the Kind switch (it's a struct).
+	// 1 & 2. Dereference pointers; nil pointer → NULL.
+	for v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return "NULL"
+		}
+		v = v.Elem()
+	}
+
+	// 3. time.Time
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
 		if t.IsZero() {
@@ -103,10 +124,19 @@ func structFieldToSQL(v reflect.Value) string {
 		}
 		return fmt.Sprintf("DATE('%s')", t.UTC().Format("2006-01-02 15:04:05"))
 	}
+
+	// 4. fmt.Stringer — value receiver or pointer receiver.
+	if v.Type().Implements(stringerType) {
+		return quotedString(v.Interface().(fmt.Stringer).String())
+	}
+	if v.CanAddr() && v.Addr().Type().Implements(stringerType) {
+		return quotedString(v.Addr().Interface().(fmt.Stringer).String())
+	}
+
+	// 5. Primitive kinds.
 	switch v.Kind() { //nolint:exhaustive
 	case reflect.String:
-		s := strings.ReplaceAll(v.String(), "'", "''")
-		return "'" + s + "'"
+		return quotedString(v.String())
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return strconv.FormatInt(v.Int(), 10)
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
@@ -118,13 +148,29 @@ func structFieldToSQL(v reflect.Value) string {
 			return "1"
 		}
 		return "0"
-	default:
-		return "NULL"
 	}
+	return "NULL"
 }
 
+// setStructField writes a vapordb Value into a reflect.Value struct field.
+// Resolution order:
+//  1. Pointer field   → allocate, recurse into the pointed-to type
+//  2. time.Time       → parse / assign directly
+//  3. encoding.TextUnmarshaler → UnmarshalText(string value)
+//  4. Primitive kinds (string, int, float, bool)
 func setStructField(field reflect.Value, val Value) {
-	// Handle time.Time fields regardless of Kind.
+	// 1. Pointer field: allocate a new value and recurse.
+	if field.Kind() == reflect.Pointer {
+		if val.Kind == KindNull {
+			return // leave nil
+		}
+		inner := reflect.New(field.Type().Elem())
+		setStructField(inner.Elem(), val)
+		field.Set(inner)
+		return
+	}
+
+	// 2. time.Time
 	if field.Type() == timeType {
 		switch x := val.V.(type) {
 		case time.Time:
@@ -136,6 +182,23 @@ func setStructField(field reflect.Value, val Value) {
 		}
 		return
 	}
+
+	// 3. encoding.TextUnmarshaler (e.g. uuid.UUID, net.IP, …).
+	if field.CanAddr() {
+		if tu, ok := field.Addr().Interface().(encoding.TextUnmarshaler); ok {
+			var text string
+			switch x := val.V.(type) {
+			case string:
+				text = x
+			default:
+				text = fmt.Sprintf("%v", x)
+			}
+			_ = tu.UnmarshalText([]byte(text))
+			return
+		}
+	}
+
+	// 4. Primitive kinds.
 	switch field.Kind() { //nolint:exhaustive
 	case reflect.String:
 		field.SetString(fmt.Sprintf("%v", val.V))
@@ -161,4 +224,8 @@ func setStructField(field reflect.Value, val Value) {
 			field.SetBool(b != 0)
 		}
 	}
+}
+
+func quotedString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
