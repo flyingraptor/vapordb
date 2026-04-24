@@ -20,12 +20,25 @@ func New() *DB {
 	return &DB{Tables: make(map[string]*Table)}
 }
 
-// Query executes a SELECT, UNION, or WITH (CTE) statement and returns the matching rows.
+// Query executes a SELECT, UNION, WITH (CTE), or DML with RETURNING and returns rows.
+//
+// For DML statements (INSERT / UPDATE / DELETE) append a RETURNING clause to get
+// back the affected rows:
+//
+//	db.Query(`INSERT INTO t (id, name) VALUES (1, 'alice') RETURNING *`)
+//	db.Query(`UPDATE t SET name = 'bob' WHERE id = 1 RETURNING id, name`)
+//	db.Query(`DELETE FROM t WHERE id = 1 RETURNING id`)
 func (db *DB) Query(sql string) ([]Row, error) {
 	target, mainSQL, err := resolveCTEs(db, sql)
 	if err != nil {
 		return nil, err
 	}
+
+	// DML with RETURNING is handled before SELECT-only processing.
+	if dmlSQL, retCols, hasReturning := extractReturning(mainSQL); hasReturning {
+		return execDMLReturning(target, dmlSQL, retCols)
+	}
+
 	mainSQL, winSpecs, err := extractWindowFuncs(mainSQL)
 	if err != nil {
 		return nil, err

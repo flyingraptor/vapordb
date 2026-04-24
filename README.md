@@ -23,6 +23,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
 - **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
 - **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX` with `OVER([PARTITION BY …] [ORDER BY …])`.
+- **`RETURNING` clause.** Append `RETURNING col1, col2` (or `RETURNING *`) to any `INSERT`, `UPDATE`, or `DELETE` and call `db.Query(…)` to get back the affected rows. For INSERT the returned rows are the newly inserted rows. For UPDATE the rows are in their post-update state. For DELETE the rows are in their pre-deletion state.
 - **CTEs (`WITH … AS (…) SELECT …`).** One or more named subqueries before the main SELECT. Later CTEs can reference earlier ones. CTE names act as virtual tables for the main query, `JOIN`s, `EXISTS` subqueries, and derived tables.
 - **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs, with optional `ORDER BY` / `LIMIT` on the combined result.
 - **Subqueries in `FROM`.** `SELECT … FROM (SELECT …) AS sub` — derived tables, including joins against derived tables and nested subqueries.
@@ -386,6 +387,41 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### RETURNING
+
+Append a `RETURNING` clause to `INSERT`, `UPDATE`, or `DELETE` and call `db.Query` to get the affected rows back.
+
+```sql
+-- INSERT: returns the rows just inserted (their final stored state)
+db.Query(`INSERT INTO users (id, name, role) VALUES (1, 'alice', 'admin') RETURNING *`)
+db.Query(`INSERT INTO orders (id, user_id, total) VALUES (42, 1, 99.5) RETURNING id, total`)
+
+-- Multi-row INSERT returns all inserted rows
+db.Query(`INSERT INTO tags (id, label) VALUES (1, 'go'), (2, 'sql'), (3, 'db') RETURNING id, label`)
+
+-- UPDATE: returns rows in their new state
+db.Query(`UPDATE users SET role = 'owner' WHERE id = 1 RETURNING id, role`)
+db.Query(`UPDATE orders SET status = 'shipped' WHERE user_id = 1 RETURNING id, status`)
+
+-- DELETE: returns the rows as they were before deletion
+db.Query(`DELETE FROM sessions WHERE expires_at < '2026-01-01' RETURNING id`)
+db.Query(`DELETE FROM users WHERE id = 5 RETURNING *`)
+
+-- Column alias in RETURNING
+db.Query(`INSERT INTO t (id) VALUES (7) RETURNING id AS created_id`)
+```
+
+`RETURNING *` returns all columns. Specific columns (with optional `AS alias`) can be named in a comma-separated list. Works with named parameters too:
+
+```go
+rows, err := db.QueryNamed(
+    `INSERT INTO users (id, name) VALUES (:id, :name) RETURNING id, name`,
+    map[string]any{"id": 1, "name": "alice"},
+)
+```
+
+`RETURNING` is detected by a pre-processor before the SQL parser sees the statement; the stripped DML is then executed normally. Use `db.Exec` when you do not need the rows back.
+
 ### Window Functions
 
 Window functions compute a value for each row based on a related set of rows (the window), without collapsing rows the way `GROUP BY` does.
@@ -717,6 +753,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 **Added**
 
+- **`RETURNING` clause.** Append `RETURNING col1, col2` or `RETURNING *` to any `INSERT`, `UPDATE`, or `DELETE` and call `db.Query(…)` to receive the affected rows. INSERT returns the newly inserted rows; UPDATE returns the rows in their post-update state; DELETE returns the rows in their pre-deletion state. Specific columns with optional `AS alias` are supported, as are named parameters (`QueryNamed`). Implemented as a pre-processor that strips the clause before handing the DML to the parser.
 - **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, and `MAX(col)` with `OVER([PARTITION BY …] [ORDER BY …])`. Implemented via pre-processing: window expressions are extracted before the SQL parser sees the query, executed as placeholder columns, and replaced with computed values on the result rows. Aggregate window functions (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`) return the same value for every row in the partition. Ranking functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`) return per-row positions according to the OVER ORDER BY. Columns referenced in `PARTITION BY`, `ORDER BY`, and the function argument do not need to be present in the outer `SELECT` list. Window functions compose with `WHERE`, `GROUP BY`, `HAVING`, `JOIN`, `UNION`, and CTEs.
 
 ### 2026-04-25
