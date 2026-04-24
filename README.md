@@ -21,9 +21,11 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Automatic schema evolution.** New columns are added on the fly. Safe type widening (e.g. `int` to `float`) happens automatically.
 - **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
+- **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
 - **Date support.** `KindDate` type backed by `time.Time`. Date literals, comparisons, BETWEEN, ORDER BY, and date functions (NOW, CURDATE, DATE, YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, DATE_FORMAT, …). String literals auto-coerce when compared against date columns.
+- **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct.
+- **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
-- **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags.
 
 ## Installation
 
@@ -111,6 +113,79 @@ products := vapordb.ScanRows[Product](rows)
 ```
 
 NULL columns are mapped to the field's zero value (`0`, `""`, `false`).
+
+### Pointer fields
+
+Pointer fields map NULL to `nil` and non-NULL to an allocated value:
+
+```go
+type User struct {
+    ID    int     `db:"id"`
+    Name  string  `db:"name"`
+    Bio   *string `db:"bio"`   // NULL when not set
+}
+
+bio := "Go enthusiast"
+db.InsertStruct("users", User{ID: 1, Name: "Alice", Bio: &bio})
+db.InsertStruct("users", User{ID: 2, Name: "Bob"})   // Bio is nil → NULL
+
+rows, _ := db.Query(`SELECT id, name, bio FROM users ORDER BY id`)
+users := vapordb.ScanRows[User](rows)
+// users[0].Bio  →  &"Go enthusiast"
+// users[1].Bio  →  nil
+```
+
+### sql.NullString and sql.Null* types
+
+The standard `database/sql` nullable types work out of the box via the `driver.Valuer` / `sql.Scanner` interfaces:
+
+```go
+type Order struct {
+    ID      int            `db:"id"`
+    Note    sql.NullString `db:"note"`    // nullable string
+    Qty     sql.NullInt64  `db:"qty"`     // nullable int
+}
+
+db.InsertStruct("orders", Order{
+    ID:   1,
+    Note: sql.NullString{String: "urgent", Valid: true},
+    Qty:  sql.NullInt64{Int64: 3, Valid: true},
+})
+db.InsertStruct("orders", Order{
+    ID:   2,
+    Note: sql.NullString{Valid: false},   // → NULL
+    Qty:  sql.NullInt64{Valid: false},    // → NULL
+})
+
+rows, _ := db.Query(`SELECT id, note, qty FROM orders ORDER BY id`)
+orders := vapordb.ScanRows[Order](rows)
+// orders[1].Note.Valid  →  false
+```
+
+### Custom types (driver.Valuer / sql.Scanner)
+
+Any type implementing both interfaces round-trips automatically:
+
+```go
+type Status string
+
+func (s Status) Value() (driver.Value, error) { return string(s), nil }
+func (s *Status) Scan(src any) error {
+    if v, ok := src.(string); ok { *s = Status(v) }
+    return nil
+}
+
+type Task struct {
+    ID     int    `db:"id"`
+    Status Status `db:"status"`
+}
+
+db.InsertStruct("tasks", Task{ID: 1, Status: "open"})
+tasks := vapordb.ScanRows[Task](mustQuery(db, `SELECT id, status FROM tasks`))
+// tasks[0].Status  →  "open"
+```
+
+Types implementing `fmt.Stringer` and `encoding.TextUnmarshaler` (such as `net.IP` or `uuid.UUID`) also round-trip without any extra code.
 
 ## Named Parameters
 
@@ -296,6 +371,46 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### UPSERT
+
+PostgreSQL-style `ON CONFLICT` is fully supported. Conflict detection is done by value-equality on the specified column(s); no unique index is required.
+
+```sql
+-- Update specific columns when a row with the same id already exists.
+INSERT INTO users (id, name, score)
+VALUES (1, 'Alice', 99)
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, score = EXCLUDED.score
+
+-- Update only one column; leave others untouched.
+INSERT INTO products (sku, name, price)
+VALUES ('A1', 'Widget', 14.99)
+ON CONFLICT (sku) DO UPDATE SET price = EXCLUDED.price
+
+-- Composite conflict key (both columns must match).
+INSERT INTO scores (user_id, game, score)
+VALUES (7, 'chess', 200)
+ON CONFLICT (user_id, game) DO UPDATE SET score = EXCLUDED.score
+
+-- Use a constant in the SET clause instead of EXCLUDED.
+INSERT INTO tasks (id, status) VALUES (3, 'done')
+ON CONFLICT (id) DO UPDATE SET status = 'archived'
+
+-- Skip the insert silently if a conflict is found.
+INSERT INTO users (id, name) VALUES (1, 'Bob')
+ON CONFLICT (id) DO NOTHING
+```
+
+In Go:
+
+```go
+db.Exec(`
+    INSERT INTO users (id, name, score) VALUES (1, 'Alice', 42)
+    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, score = EXCLUDED.score
+`)
+```
+
+`EXCLUDED.col` refers to the value that was in the incoming row for that column, matching PostgreSQL semantics.
+
 ## Use Cases
 
 **Microservice with lightweight local state**
@@ -354,7 +469,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **`ON CONFLICT … DO UPDATE SET`** (UPSERT) Parse and execute PostgreSQL-style upsert so write paths don't require a separate SELECT + conditional INSERT/UPDATE.
 - **`= ANY(…)` / `<> ALL(…)` array operators** `IN` and `NOT IN` with literal lists already work. This item covers the PostgreSQL-dialect syntax `WHERE col = ANY(array)` / `WHERE col <> ALL(array)`, evaluated using the same underlying `IN` / `NOT IN` logic so batch-ID queries like `WHERE group_id = ANY(:group_ids)` work without rewriting.
 - **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
 - **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
@@ -368,6 +482,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 **Added**
 
+- **UPSERT (`ON CONFLICT … DO UPDATE SET` / `DO NOTHING`).** PostgreSQL-style upsert is pre-processed and translated to the MySQL ON DUPLICATE KEY UPDATE form the parser understands. Conflict detection scans for rows matching on the specified column(s); on a hit the SET assignments are applied in place. Composite conflict keys, batch-value inserts, partial updates (updating only some columns), constant expressions in the SET clause, and the silent-skip variant (`DO NOTHING`) are all supported.
 - **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.
 - **Pointer and Stringer support in struct mapping.** `InsertStruct` now dereferences pointer fields (`*string`, `*int`, `*float64`, …) and nil pointers become NULL. Types implementing `fmt.Stringer` (e.g. `net.IP`, `uuid.UUID`) are stored using their `String()` output. `ScanRows` allocates pointer fields when the column is non-NULL and uses `encoding.TextUnmarshaler` to reconstruct custom types from their stored string form.
 - **`driver.Valuer` / `sql.Scanner` support.** `InsertStruct` calls `Value()` on any field implementing `database/sql/driver.Valuer` (e.g. `sql.NullString`, `sql.NullInt64`, custom types) and converts the result to a SQL literal. `ScanRows` calls `Scan(src)` on any field implementing `database/sql.Scanner`, passing the raw stored value. This makes `sql.Null*` types and any custom type following the standard database interface contract work automatically.

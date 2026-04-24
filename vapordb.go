@@ -35,13 +35,14 @@ func (db *DB) Query(sql string) ([]Row, error) {
 
 // Exec executes an INSERT, UPDATE, or DELETE statement.
 func (db *DB) Exec(sql string) error {
-	stmt, err := sqlparser.Parse(sql)
+	rewritten, conflictCols, doNothing := rewriteOnConflict(sql)
+	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
 	}
 	switch s := stmt.(type) {
 	case *sqlparser.Insert:
-		return execInsert(db, s)
+		return execInsert(db, s, conflictCols, doNothing)
 	case *sqlparser.Update:
 		return execUpdate(db, s)
 	case *sqlparser.Delete:

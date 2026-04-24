@@ -168,9 +168,13 @@ func rowKey(row Row) string {
 	return sb.String()
 }
 
-// ─── INSERT ──────────────────────────────────────────────────────────────────
+// ─── INSERT / UPSERT ─────────────────────────────────────────────────────────
 
-func execInsert(db *DB, stmt *sqlparser.Insert) error {
+// execInsert handles plain INSERT and the two upsert variants:
+//
+//   - conflictCols non-nil + stmt.OnDup non-nil  →  update existing row on match
+//   - conflictCols non-nil + doNothing true       →  skip insert on conflict
+func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool) error {
 	tableName := stmt.Table.Name.String()
 
 	values, ok := stmt.Rows.(sqlparser.Values)
@@ -199,8 +203,25 @@ func execInsert(db *DB, stmt *sqlparser.Insert) error {
 			}
 			row[cols[i]] = val
 		}
+
+		// ── Upsert path ──────────────────────────────────────────────────────
+		if len(conflictCols) > 0 {
+			UpsertSchema(db, tableName, row)
+			tbl := db.Tables[tableName]
+			if idx := findConflict(tbl, conflictCols, row); idx >= 0 {
+				// Conflict found.
+				if doNothing {
+					continue // skip this row silently
+				}
+				// Apply ON DUPLICATE KEY UPDATE assignments.
+				if err := applyOnDup(tbl.Rows[idx], row, stmt.OnDup); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		// ── Normal insert ────────────────────────────────────────────────────
 		UpsertSchema(db, tableName, row)
-		// Fill missing schema columns with NULL.
 		tbl := db.Tables[tableName]
 		for col := range tbl.Schema {
 			if _, exists := row[col]; !exists {
@@ -208,6 +229,57 @@ func execInsert(db *DB, stmt *sqlparser.Insert) error {
 			}
 		}
 		tbl.Rows = append(tbl.Rows, row)
+	}
+	return nil
+}
+
+// findConflict returns the index of the first row in tbl whose values for all
+// conflictCols match the incoming row, or -1 if no conflict exists.
+func findConflict(tbl *Table, conflictCols []string, incoming Row) int {
+	if tbl == nil {
+		return -1
+	}
+	for i, existing := range tbl.Rows {
+		match := true
+		for _, col := range conflictCols {
+			if existing[col] != incoming[col] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// applyOnDup updates target in-place using the OnDup assignment list from the
+// parsed INSERT statement. Each assignment is either VALUES(col) — meaning
+// "use the value from the incoming row" — or any other expression evaluated
+// against the incoming row as context.
+func applyOnDup(target Row, incoming Row, onDup sqlparser.OnDup) error {
+	for _, upd := range onDup {
+		colName := upd.Name.Name.Lowered()
+		var newVal Value
+		switch expr := upd.Expr.(type) {
+		case *sqlparser.ValuesFuncExpr:
+			// VALUES(col) → take the value from the incoming row.
+			ref := expr.Name.Name.Lowered()
+			v, ok := incoming[ref]
+			if !ok {
+				v = Null
+			}
+			newVal = v
+		default:
+			// General expression evaluated in the context of the incoming row.
+			var err error
+			newVal, err = evalExpr(expr, incoming)
+			if err != nil {
+				return fmt.Errorf("ON CONFLICT update expr for %q: %w", colName, err)
+			}
+		}
+		target[colName] = newVal
 	}
 	return nil
 }
