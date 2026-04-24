@@ -4,6 +4,9 @@ cmd/
 # local example models — not part of the library
 example models/
 
+# AI assistant context
+CLAUDE.md
+
 # binaries
 /vapordb
 
