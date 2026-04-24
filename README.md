@@ -68,6 +68,8 @@ func main() {
 | `db.Load(path)` | Load a previously saved JSON file |
 | `db.InsertStruct(table, v)` | Insert a struct using `db` field tags |
 | `vapordb.ScanRows[T](rows)` | Scan `[]Row` into a typed slice |
+| `db.QueryNamed(sql, params)` | SELECT with named `:param` placeholders |
+| `db.ExecNamed(sql, params)` | INSERT/UPDATE/DELETE with named `:param` placeholders |
 
 A `Row` is `map[string]Value`. Each `Value` has:
 - `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, `time.Time`, or `nil`)
@@ -109,6 +111,36 @@ products := vapordb.ScanRows[Product](rows)
 ```
 
 NULL columns are mapped to the field's zero value (`0`, `""`, `false`).
+
+## Named Parameters
+
+Use `:name` placeholders instead of inlining values into SQL strings. Pass either a `map[string]any` or a struct with `db` tags.
+
+```go
+// map
+rows, err := db.QueryNamed(
+    `SELECT * FROM orders WHERE user_id = :uid AND status = :status`,
+    map[string]any{"uid": 42, "status": "open"},
+)
+
+// struct
+type Filter struct {
+    MinAge int    `db:"min"`
+    MaxAge int    `db:"max"`
+}
+rows, err = db.QueryNamed(
+    `SELECT name FROM users WHERE age BETWEEN :min AND :max`,
+    Filter{MinAge: 25, MaxAge: 35},
+)
+
+// insert
+err = db.ExecNamed(
+    `INSERT INTO users (id, name, age) VALUES (:id, :name, :age)`,
+    map[string]any{"id": 5, "name": "Eve", "age": 28},
+)
+```
+
+Single-quoted string literals in the SQL are never scanned for placeholders, so values like `WHERE note = ':not_a_param'` are safe. Single quotes inside string values are automatically escaped.
 
 ## Persistence
 
@@ -322,7 +354,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **Named parameters** `db.QueryNamed(sql, params)` / `db.ExecNamed(sql, params)` accepting a struct or `map[string]any` with `:param` substitution (sqlx-style). Unlocks real-world query files without rewriting every literal.
 - **`fmt.Stringer` / pointer support in struct mapping** Dereference pointer fields (`*time.Time`, `*string`, …) and call `.String()` on types like `uuid.UUID` so `InsertStruct` and `ScanRows` handle them correctly instead of falling back to NULL.
 - **`driver.Valuer` / `driver.Scanner` support** Honour the standard `database/sql/driver` interfaces so custom types like `date.Date` round-trip automatically through `InsertStruct` and `ScanRows`.
 - **`ON CONFLICT … DO UPDATE SET`** (UPSERT) Parse and execute PostgreSQL-style upsert so write paths don't require a separate SELECT + conditional INSERT/UPDATE.
@@ -334,6 +365,12 @@ Sketch out a data model and queries before committing to a real database schema.
 - **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
 
 ## Changelog
+
+### 2026-04-25
+
+**Added**
+
+- **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.
 
 ### 2026-04-24
 
