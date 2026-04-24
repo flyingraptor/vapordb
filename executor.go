@@ -324,7 +324,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 
 	// WHERE.
 	if stmt.Where != nil {
-		rows, err = applyWhere(rows, stmt.Where)
+		rows, err = applyWhere(db, rows, stmt.Where)
 		if err != nil {
 			return nil, err
 		}
@@ -338,7 +338,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 			return nil, err
 		}
 		if stmt.Having != nil {
-			rows, err = applyWhere(rows, stmt.Having)
+			rows, err = applyWhere(db, rows, stmt.Having)
 			if err != nil {
 				return nil, err
 			}
@@ -350,7 +350,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 	// ORDER BY can reference computed columns like `ORDER BY revenue` when
 	// `revenue` is defined as `price * qty AS revenue` in the SELECT list.
 	if len(stmt.OrderBy) > 0 {
-		rows, err = enrichWithAliases(rows, stmt.SelectExprs)
+		rows, err = enrichWithAliases(db, rows, stmt.SelectExprs)
 		if err != nil {
 			return nil, err
 		}
@@ -368,7 +368,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 	}
 
 	// Project columns.
-	projected, err := projectRows(rows, stmt.SelectExprs, isMultiTable)
+	projected, err := projectRows(db, rows, stmt.SelectExprs, isMultiTable)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +401,7 @@ func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 				result = append(result, merged)
 				matched = true
 			} else {
-				ok, err := evalBool(jd.condition, merged)
+				ok, err := evalBoolWithDB(db, jd.condition, merged)
 				if err != nil {
 					return nil, err
 				}
@@ -418,10 +418,10 @@ func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 	return result, nil
 }
 
-func applyWhere(rows []Row, where *sqlparser.Where) ([]Row, error) {
+func applyWhere(db *DB, rows []Row, where *sqlparser.Where) ([]Row, error) {
 	result := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		ok, err := evalBool(where.Expr, row)
+		ok, err := evalBoolWithDB(db, where.Expr, row)
 		if err != nil {
 			return nil, err
 		}
@@ -782,10 +782,10 @@ func applyLimit(rows []Row, limit *sqlparser.Limit) ([]Row, error) {
 	return rows[offset:end], nil
 }
 
-func projectRows(rows []Row, selectExprs sqlparser.SelectExprs, isJoin bool) ([]Row, error) {
+func projectRows(db *DB, rows []Row, selectExprs sqlparser.SelectExprs, isJoin bool) ([]Row, error) {
 	result := make([]Row, 0, len(rows))
 	for _, row := range rows {
-		out, err := projectRow(row, selectExprs, isJoin)
+		out, err := projectRow(db, row, selectExprs, isJoin)
 		if err != nil {
 			return nil, err
 		}
@@ -794,7 +794,7 @@ func projectRows(rows []Row, selectExprs sqlparser.SelectExprs, isJoin bool) ([]
 	return result, nil
 }
 
-func projectRow(row Row, selectExprs sqlparser.SelectExprs, isJoin bool) (Row, error) {
+func projectRow(db *DB, row Row, selectExprs sqlparser.SelectExprs, isJoin bool) (Row, error) {
 	out := make(Row)
 	for _, se := range selectExprs {
 		switch s := se.(type) {
@@ -819,7 +819,7 @@ func projectRow(row Row, selectExprs sqlparser.SelectExprs, isJoin bool) (Row, e
 			}
 		case *sqlparser.AliasedExpr:
 			key := outputKey(s)
-			val, err := evalExpr(s.Expr, row)
+			val, err := evalExprWithDB(db, s.Expr, row)
 			if err != nil {
 				return nil, err
 			}
@@ -844,7 +844,7 @@ func outputKey(ae *sqlparser.AliasedExpr) string {
 // enrichWithAliases adds SELECT-expression alias values to each working row so
 // that ORDER BY can reference them by alias name before final projection.
 // Existing keys are never overwritten, so real table columns take precedence.
-func enrichWithAliases(rows []Row, selectExprs sqlparser.SelectExprs) ([]Row, error) {
+func enrichWithAliases(db *DB, rows []Row, selectExprs sqlparser.SelectExprs) ([]Row, error) {
 	result := make([]Row, len(rows))
 	for i, row := range rows {
 		enriched := copyRow(row)
@@ -857,7 +857,7 @@ func enrichWithAliases(rows []Row, selectExprs sqlparser.SelectExprs) ([]Row, er
 			if _, exists := enriched[key]; exists {
 				continue // don't shadow a real column
 			}
-			val, err := evalExpr(ae.Expr, row)
+			val, err := evalExprWithDB(db, ae.Expr, row)
 			if err != nil {
 				return nil, err
 			}
@@ -904,7 +904,7 @@ func execUpdate(db *DB, stmt *sqlparser.Update) error {
 
 	for i, row := range tbl.Rows {
 		if stmt.Where != nil {
-			match, err := evalBool(stmt.Where.Expr, row)
+			match, err := evalBoolWithDB(db, stmt.Where.Expr, row)
 			if err != nil {
 				return err
 			}
@@ -960,7 +960,7 @@ func execDelete(db *DB, stmt *sqlparser.Delete) error {
 
 	kept := make([]Row, 0, len(tbl.Rows))
 	for _, row := range tbl.Rows {
-		match, err := evalBool(stmt.Where.Expr, row)
+		match, err := evalBoolWithDB(db, stmt.Where.Expr, row)
 		if err != nil {
 			return err
 		}
@@ -970,6 +970,116 @@ func execDelete(db *DB, stmt *sqlparser.Delete) error {
 	}
 	tbl.Rows = kept
 	return nil
+}
+
+// ─── EXISTS / CORRELATED SUBQUERY ────────────────────────────────────────────
+
+// execSelectCorrelated runs an EXISTS subquery, merging outerRow as a fallback
+// so that correlated column references (e.g. users.id in an inner WHERE) resolve
+// correctly against the outer driving row.
+func execSelectCorrelated(db *DB, ex *sqlparser.ExistsExpr, outerRow Row) ([]Row, error) {
+	inner, ok := ex.Subquery.Select.(*sqlparser.Select)
+	if !ok {
+		return nil, fmt.Errorf("EXISTS: unsupported subquery type %T", ex.Subquery.Select)
+	}
+	refs, joins, err := extractFromClause(inner.From)
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("EXISTS subquery: no tables in FROM clause")
+	}
+
+	isMultiTable := len(refs) > 1
+	var rows []Row
+	if tbl := db.Tables[refs[0].name]; tbl != nil {
+		rows = make([]Row, len(tbl.Rows))
+		for i, r := range tbl.Rows {
+			if isMultiTable {
+				rows[i] = qualifyRow(r, refs[0].alias)
+			} else {
+				rows[i] = copyRow(r)
+			}
+		}
+	}
+	for _, jd := range joins {
+		if rows, err = applyJoin(db, rows, jd); err != nil {
+			return nil, err
+		}
+	}
+	if inner.Where != nil {
+		filtered := rows[:0]
+		for _, r := range rows {
+			// Merge: inner columns take priority; outer fills in correlation references.
+			merged := mergeRowsOuter(outerRow, r)
+			ok, err := evalBool(inner.Where.Expr, merged)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				filtered = append(filtered, r)
+			}
+		}
+		rows = filtered
+	}
+	return rows, nil
+}
+
+// mergeRowsOuter creates a row containing all of inner's columns plus any
+// outer columns not already present. Inner always wins on key conflicts.
+func mergeRowsOuter(outer, inner Row) Row {
+	result := copyRow(inner)
+	for k, v := range outer {
+		if _, exists := result[k]; !exists {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// evalExprWithDB evaluates an expression, routing *sqlparser.ExistsExpr through
+// the correlated subquery engine. All other nodes delegate to evalExpr.
+func evalExprWithDB(db *DB, expr sqlparser.Expr, row Row) (Value, error) {
+	if ex, ok := expr.(*sqlparser.ExistsExpr); ok {
+		rows, err := execSelectCorrelated(db, ex, row)
+		if err != nil {
+			return Null, err
+		}
+		return Value{Kind: KindBool, V: len(rows) > 0}, nil
+	}
+	return evalExpr(expr, row)
+}
+
+// evalBoolWithDB evaluates a boolean expression, handling ExistsExpr at any
+// depth inside AND / OR / NOT / parentheses. Falls through to evalBool for
+// subtrees that contain no EXISTS.
+func evalBoolWithDB(db *DB, expr sqlparser.Expr, row Row) (bool, error) {
+	switch e := expr.(type) {
+	case *sqlparser.ExistsExpr:
+		rows, err := execSelectCorrelated(db, e, row)
+		return len(rows) > 0, err
+	case *sqlparser.AndExpr:
+		left, err := evalBoolWithDB(db, e.Left, row)
+		if err != nil || !left {
+			return left, err
+		}
+		return evalBoolWithDB(db, e.Right, row)
+	case *sqlparser.OrExpr:
+		left, err := evalBoolWithDB(db, e.Left, row)
+		if err != nil {
+			return false, err
+		}
+		if left {
+			return true, nil
+		}
+		return evalBoolWithDB(db, e.Right, row)
+	case *sqlparser.NotExpr:
+		v, err := evalBoolWithDB(db, e.Expr, row)
+		return !v, err
+	case *sqlparser.ParenExpr:
+		return evalBoolWithDB(db, e.Expr, row)
+	}
+	return evalBool(expr, row)
 }
 
 // ─── EXPRESSION EVALUATION ───────────────────────────────────────────────────

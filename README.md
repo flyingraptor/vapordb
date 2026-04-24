@@ -381,6 +381,33 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### EXISTS
+
+```sql
+-- Existence check (top-level, uncorrelated)
+SELECT EXISTS (SELECT 1 FROM users WHERE id = 5)
+
+-- Semi-join: return users that have at least one order (correlated)
+SELECT name FROM users
+WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
+
+-- Anti-join: users with no orders
+SELECT name FROM users
+WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
+
+-- Combine with other predicates
+SELECT name FROM users
+WHERE active = 1
+  AND EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id AND orders.status = 'open')
+
+-- As a projected column (correlated boolean per row)
+SELECT id,
+       EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id) AS has_orders
+FROM users
+```
+
+The inner `WHERE` receives the outer row's columns as a fallback, so `users.id` in the subquery resolves from the driving row automatically.
+
 ### = ANY(…) / <> ALL(…)
 
 PostgreSQL-style set operators are rewritten to `IN` / `NOT IN` before parsing, so the MySQL-dialect parser handles them transparently.
@@ -517,7 +544,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
 - **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
 - **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
 - **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
@@ -529,7 +555,9 @@ Sketch out a data model and queries before committing to a real database schema.
 
 **Added**
 
-- **`= ANY(…)` / `<> ALL(…)` set operators.** PostgreSQL-style `WHERE col = ANY(list)` and `WHERE col <> ALL(list)` are pre-processed to `IN` / `NOT IN`. Named slice parameters (`:ids` where `ids` is a `[]int`, `[]string`, etc.) expand element-by-element inside the list so batch-ID queries like `WHERE id = ANY(:ids)` work without any string building.
+- **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated subqueries in both `WHERE EXISTS (…)` and as a projected column (`SELECT EXISTS(…) AS has_x`). Inner WHERE resolves outer row columns as fallback, so standard semi-join patterns like `WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)` work out of the box.
+- **`= ANY(…)` / `<> ALL(…)`.** PostgreSQL-style `WHERE col = ANY(list)` and `WHERE col <> ALL(list)` are pre-processed to `IN` / `NOT IN`. Named slice parameters (`:ids` where `ids` is a `[]int`, `[]string`, etc.) expand element-by-element inside the list so batch-ID queries like `WHERE id = ANY(:ids)` work without any string building.
+- **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated EXISTS subqueries work in `WHERE EXISTS (…)`, `WHERE NOT EXISTS (…)`, inside `AND` / `OR` / `NOT` compounds, and as projected columns (`SELECT EXISTS(…) AS has_x FROM t`). The inner SELECT receives the outer driving row's columns as a fallback context so correlated references like `WHERE orders.user_id = users.id` resolve without any extra syntax.
 - **UPSERT (`ON CONFLICT … DO UPDATE SET` / `DO NOTHING`).** PostgreSQL-style upsert is pre-processed and translated to the MySQL ON DUPLICATE KEY UPDATE form the parser understands. Conflict detection scans for rows matching on the specified column(s); on a hit the SET assignments are applied in place. Composite conflict keys, batch-value inserts, partial updates (updating only some columns), constant expressions in the SET clause, and the silent-skip variant (`DO NOTHING`) are all supported.
 - **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.
 - **Pointer and Stringer support in struct mapping.** `InsertStruct` now dereferences pointer fields (`*string`, `*int`, `*float64`, …) and nil pointers become NULL. Types implementing `fmt.Stringer` (e.g. `net.IP`, `uuid.UUID`) are stored using their `String()` output. `ScanRows` allocates pointer fields when the column is non-NULL and uses `encoding.TextUnmarshaler` to reconstruct custom types from their stored string form.
