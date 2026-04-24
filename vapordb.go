@@ -20,13 +20,17 @@ func New() *DB {
 	return &DB{Tables: make(map[string]*Table)}
 }
 
-// Query executes a SELECT or UNION statement and returns the matching rows.
+// Query executes a SELECT, UNION, or WITH (CTE) statement and returns the matching rows.
 func (db *DB) Query(sql string) ([]Row, error) {
-	stmt, err := sqlparser.Parse(rewriteAnyAll(sql))
+	target, mainSQL, err := resolveCTEs(db, sql)
+	if err != nil {
+		return nil, err
+	}
+	stmt, err := sqlparser.Parse(rewriteAnyAll(mainSQL))
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	return execSelectStatement(db, stmt)
+	return execSelectStatement(target, stmt)
 }
 
 // execSelectStatement dispatches a parsed statement to execSelect or execUnion.
@@ -41,8 +45,14 @@ func execSelectStatement(db *DB, stmt sqlparser.Statement) ([]Row, error) {
 	}
 }
 
-// Exec executes an INSERT, UPDATE, or DELETE statement.
+// Exec executes an INSERT, UPDATE, DELETE, or WITH … SELECT statement.
 func (db *DB) Exec(sql string) error {
+	target, mainSQL, err := resolveCTEs(db, sql)
+	if err != nil {
+		return err
+	}
+	db = target
+	sql = mainSQL
 	rewritten, conflictCols, doNothing := rewriteOnConflict(rewriteAnyAll(sql))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {

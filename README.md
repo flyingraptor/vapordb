@@ -22,6 +22,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
 - **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
+- **CTEs (`WITH … AS (…) SELECT …`).** One or more named subqueries before the main SELECT. Later CTEs can reference earlier ones. CTE names act as virtual tables for the main query, `JOIN`s, `EXISTS` subqueries, and derived tables.
 - **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs, with optional `ORDER BY` / `LIMIT` on the combined result.
 - **Subqueries in `FROM`.** `SELECT … FROM (SELECT …) AS sub` — derived tables, including joins against derived tables and nested subqueries.
 - **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated, in `WHERE` and as a projected column.
@@ -384,6 +385,49 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### CTEs (Common Table Expressions)
+
+```sql
+-- Single CTE
+WITH active AS (
+  SELECT id, name FROM users WHERE active = 1
+)
+SELECT name FROM active ORDER BY name
+
+-- Multiple CTEs (later can reference earlier)
+WITH
+  order_totals AS (
+    SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id
+  ),
+  big_spenders AS (
+    SELECT user_id FROM order_totals WHERE total >= 150
+  )
+SELECT u.name
+FROM users u
+INNER JOIN big_spenders b ON b.user_id = u.id
+
+-- CTE referencing an earlier CTE
+WITH
+  filtered AS (SELECT id, v FROM t WHERE v > 10),
+  ranked   AS (SELECT id, v FROM filtered WHERE v < 50)
+SELECT id FROM ranked ORDER BY id
+
+-- CTE body can use UNION
+WITH combined AS (
+  SELECT id FROM active_users
+  UNION
+  SELECT id FROM archived_users
+)
+SELECT id FROM combined ORDER BY id
+
+-- CTE used with EXISTS in the main query
+WITH candidates AS (SELECT id, name FROM users WHERE region = 'eu')
+SELECT name FROM candidates
+WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = candidates.id)
+```
+
+Keywords `WITH` and `AS` are case-insensitive. The `WITH` clause is pre-processed before the SQL parser sees the query, so CTE names become ordinary virtual tables for the remainder of the statement. `WITH RECURSIVE` is not currently supported.
+
 ### UNION / UNION ALL
 
 ```sql
@@ -617,7 +661,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
 - **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
 
 ## Changelog
@@ -626,6 +669,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 **Added**
 
+- **CTEs (`WITH … AS (…) SELECT …`).** `WITH` is pre-processed before the SQL parser: each CTE body is executed and its result stored as a virtual table available to the main query and to later CTEs. Multiple CTEs, CTEs referencing earlier CTEs, CTEs containing `UNION`, and CTEs used with `EXISTS` or `JOIN` all work. Keywords `WITH`/`AS` are case-insensitive.
 - **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs. `UNION` deduplicates, `UNION ALL` keeps every row. Chains of three or more are supported, mixed `UNION` / `UNION ALL` in the same chain works correctly. A top-level `ORDER BY` and `LIMIT` can be applied to the combined result.
 - **Subqueries in `FROM` (derived tables).** `SELECT … FROM (SELECT …) AS sub` executes the inner SELECT first and uses its result rows as a virtual table. Supports `SELECT *`, outer `WHERE`, qualified `alias.col` references, `JOIN` against derived tables (including aggregated subqueries), `ORDER BY` / `LIMIT` inside the subquery, and nested derived tables.
 - **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated EXISTS subqueries work in `WHERE EXISTS (…)`, `WHERE NOT EXISTS (…)`, inside `AND` / `OR` / `NOT` compounds, and as projected columns (`SELECT EXISTS(…) AS has_x FROM t`). The inner SELECT receives the outer driving row's columns as a fallback context so correlated references like `WHERE orders.user_id = users.id` resolve without any extra syntax.
