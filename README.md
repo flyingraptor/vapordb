@@ -22,6 +22,9 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
 - **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
+- **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs, with optional `ORDER BY` / `LIMIT` on the combined result.
+- **Subqueries in `FROM`.** `SELECT … FROM (SELECT …) AS sub` — derived tables, including joins against derived tables and nested subqueries.
+- **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated, in `WHERE` and as a projected column.
 - **Date support.** `KindDate` type backed by `time.Time`. Date literals, comparisons, BETWEEN, ORDER BY, and date functions (NOW, CURDATE, DATE, YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, DATE_FORMAT, …). String literals auto-coerce when compared against date columns.
 - **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct. Slice values expand automatically, so `= ANY(:ids)` with `[]int{1,2,3}` becomes `IN (1, 2, 3)`.
 - **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
@@ -381,6 +384,38 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### UNION / UNION ALL
+
+```sql
+-- Distinct rows from both tables (duplicates removed)
+SELECT id, name FROM users
+UNION
+SELECT id, name FROM admins
+
+-- Keep all rows including duplicates
+SELECT id FROM active_users
+UNION ALL
+SELECT id FROM archived_users
+
+-- Three-way chain
+SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c
+
+-- ORDER BY and LIMIT on the combined result
+SELECT id FROM a
+UNION ALL
+SELECT id FROM b
+ORDER BY id
+LIMIT 10
+
+-- Per-branch WHERE and aggregates
+SELECT 'north' AS region, SUM(amount) AS total FROM sales WHERE region = 'north'
+UNION ALL
+SELECT 'south' AS region, SUM(amount) AS total FROM sales WHERE region = 'south'
+ORDER BY region
+```
+
+Deduplication for `UNION` uses the same row-key fingerprint as `SELECT DISTINCT`. Mixed chains (`A UNION ALL B UNION C`) are evaluated left-to-right, with deduplication applied only at `UNION` nodes.
+
 ### Derived tables (subquery in FROM)
 
 ```sql
@@ -582,7 +617,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
 - **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
 - **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
 
@@ -592,11 +626,10 @@ Sketch out a data model and queries before committing to a real database schema.
 
 **Added**
 
-- **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated subqueries in both `WHERE EXISTS (…)` and as a projected column (`SELECT EXISTS(…) AS has_x`). Inner WHERE resolves outer row columns as fallback, so standard semi-join patterns like `WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)` work out of the box.
-- **`= ANY(…)` / `<> ALL(…)`.** PostgreSQL-style `WHERE col = ANY(list)` and `WHERE col <> ALL(list)` are pre-processed to `IN` / `NOT IN`. Named slice parameters (`:ids` where `ids` is a `[]int`, `[]string`, etc.) expand element-by-element inside the list so batch-ID queries like `WHERE id = ANY(:ids)` work without any string building.
-- **Subqueries in `FROM` (derived tables).** `SELECT … FROM (SELECT …) AS sub` executes the inner SELECT first and uses its result rows as a virtual table. Works with `SELECT *`, outer `WHERE`, qualified `sub.col` references, `INNER JOIN` / `LEFT JOIN` against derived tables, `ORDER BY` / `LIMIT` inside the subquery, and nested subqueries.
-- **Subqueries in `FROM` (derived tables).** `SELECT … FROM (SELECT …) AS sub` executes the inner query first and treats the result as a virtual table. Supports `SELECT *`, outer `WHERE`, qualified `alias.col` references, `JOIN` against derived tables (including aggregated subqueries), `ORDER BY` / `LIMIT` inside the subquery, and nested derived tables.
+- **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs. `UNION` deduplicates, `UNION ALL` keeps every row. Chains of three or more are supported, mixed `UNION` / `UNION ALL` in the same chain works correctly. A top-level `ORDER BY` and `LIMIT` can be applied to the combined result.
+- **Subqueries in `FROM` (derived tables).** `SELECT … FROM (SELECT …) AS sub` executes the inner SELECT first and uses its result rows as a virtual table. Supports `SELECT *`, outer `WHERE`, qualified `alias.col` references, `JOIN` against derived tables (including aggregated subqueries), `ORDER BY` / `LIMIT` inside the subquery, and nested derived tables.
 - **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated EXISTS subqueries work in `WHERE EXISTS (…)`, `WHERE NOT EXISTS (…)`, inside `AND` / `OR` / `NOT` compounds, and as projected columns (`SELECT EXISTS(…) AS has_x FROM t`). The inner SELECT receives the outer driving row's columns as a fallback context so correlated references like `WHERE orders.user_id = users.id` resolve without any extra syntax.
+- **`= ANY(…)` / `<> ALL(…)`.** PostgreSQL-style `WHERE col = ANY(list)` and `WHERE col <> ALL(list)` are pre-processed to `IN` / `NOT IN`. Named slice parameters (`:ids` where `ids` is a `[]int`, `[]string`, etc.) expand element-by-element inside the list so batch-ID queries like `WHERE id = ANY(:ids)` work without any string building.
 - **UPSERT (`ON CONFLICT … DO UPDATE SET` / `DO NOTHING`).** PostgreSQL-style upsert is pre-processed and translated to the MySQL ON DUPLICATE KEY UPDATE form the parser understands. Conflict detection scans for rows matching on the specified column(s); on a hit the SET assignments are applied in place. Composite conflict keys, batch-value inserts, partial updates (updating only some columns), constant expressions in the SET clause, and the silent-skip variant (`DO NOTHING`) are all supported.
 - **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.
 - **Pointer and Stringer support in struct mapping.** `InsertStruct` now dereferences pointer fields (`*string`, `*int`, `*float64`, …) and nil pointers become NULL. Types implementing `fmt.Stringer` (e.g. `net.IP`, `uuid.UUID`) are stored using their `String()` output. `ScanRows` allocates pointer fields when the column is non-NULL and uses `encoding.TextUnmarshaler` to reconstruct custom types from their stored string form.

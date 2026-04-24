@@ -20,17 +20,25 @@ func New() *DB {
 	return &DB{Tables: make(map[string]*Table)}
 }
 
-// Query executes a SELECT statement and returns the matching rows.
+// Query executes a SELECT or UNION statement and returns the matching rows.
 func (db *DB) Query(sql string) ([]Row, error) {
 	stmt, err := sqlparser.Parse(rewriteAnyAll(sql))
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	sel, ok := stmt.(*sqlparser.Select)
-	if !ok {
-		return nil, fmt.Errorf("Query only accepts SELECT statements; use Exec for %T", stmt)
+	return execSelectStatement(db, stmt)
+}
+
+// execSelectStatement dispatches a parsed statement to execSelect or execUnion.
+func execSelectStatement(db *DB, stmt sqlparser.Statement) ([]Row, error) {
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		return execSelect(db, s)
+	case *sqlparser.Union:
+		return execUnion(db, s)
+	default:
+		return nil, fmt.Errorf("Query only accepts SELECT/UNION statements; use Exec for %T", stmt)
 	}
-	return execSelect(db, sel)
 }
 
 // Exec executes an INSERT, UPDATE, or DELETE statement.
@@ -49,6 +57,9 @@ func (db *DB) Exec(sql string) error {
 		return execDelete(db, s)
 	case *sqlparser.Select:
 		_, err := execSelect(db, s)
+		return err
+	case *sqlparser.Union:
+		_, err := execUnion(db, s)
 		return err
 	default:
 		return fmt.Errorf("unsupported statement type: %T", stmt)

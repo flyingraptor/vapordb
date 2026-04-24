@@ -221,6 +221,69 @@ func rowKey(row Row) string {
 	return sb.String()
 }
 
+// ─── UNION / UNION ALL ───────────────────────────────────────────────────────
+
+// execUnion evaluates a UNION or UNION ALL statement.
+// Chain structure is left-associative: A UNION B UNION C → (A UNION B) UNION C.
+// ORDER BY and LIMIT are only applied once, at the outermost level.
+func execUnion(db *DB, stmt *sqlparser.Union) ([]Row, error) {
+	rows, err := execUnionNode(db, stmt)
+	if err != nil {
+		return nil, err
+	}
+	// Top-level ORDER BY.
+	if len(stmt.OrderBy) > 0 {
+		if err := sortRows(rows, stmt.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	// Top-level LIMIT.
+	if stmt.Limit != nil {
+		rows, err = applyLimit(rows, stmt.Limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
+}
+
+// execUnionNode recursively collects rows from a UNION tree, applying
+// deduplication at each UNION (distinct) node but not at UNION ALL nodes.
+func execUnionNode(db *DB, stmt *sqlparser.Union) ([]Row, error) {
+	// Left branch: may itself be a Union (chained) or a plain Select.
+	var leftRows []Row
+	var err error
+	switch l := stmt.Left.(type) {
+	case *sqlparser.Select:
+		leftRows, err = execSelect(db, l)
+	case *sqlparser.Union:
+		leftRows, err = execUnionNode(db, l)
+	default:
+		return nil, fmt.Errorf("UNION: unsupported left side %T", stmt.Left)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Right branch is always a plain Select per the grammar.
+	rightSel, ok := stmt.Right.(*sqlparser.Select)
+	if !ok {
+		return nil, fmt.Errorf("UNION: unsupported right side %T", stmt.Right)
+	}
+	rightRows, err := execSelect(db, rightSel)
+	if err != nil {
+		return nil, err
+	}
+
+	combined := append(leftRows, rightRows...)
+
+	if strings.EqualFold(stmt.Type, "union all") {
+		return combined, nil
+	}
+	// UNION (distinct) — remove duplicate rows.
+	return distinctRows(combined), nil
+}
+
 // ─── INSERT / UPSERT ─────────────────────────────────────────────────────────
 
 // execInsert handles plain INSERT and the two upsert variants:
