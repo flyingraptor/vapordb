@@ -381,6 +381,44 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### Derived tables (subquery in FROM)
+
+```sql
+-- Basic derived table
+SELECT name
+FROM (SELECT id, name, age FROM users WHERE age >= 25) AS sub
+
+-- Outer WHERE on the derived table
+SELECT name
+FROM (SELECT id, name, age FROM users) AS u
+WHERE age > 22
+
+-- Computed column inside the subquery, used in outer SELECT
+SELECT total
+FROM (SELECT id, amount * 2 AS total FROM orders) AS sub
+ORDER BY total
+
+-- Aggregate inside the subquery
+SELECT user_id, total
+FROM (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) AS agg
+ORDER BY total DESC
+
+-- Qualified alias.col reference
+SELECT sub.name
+FROM (SELECT id, name FROM users) AS sub
+WHERE sub.id = 1
+
+-- JOIN a real table with a derived table
+SELECT u.name, agg.total
+FROM users AS u
+INNER JOIN (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) AS agg
+  ON agg.user_id = u.id
+
+-- Nested derived tables
+SELECT id FROM
+  (SELECT id FROM (SELECT id, v FROM t WHERE v > 1) AS inner_sub WHERE v < 5) AS outer_sub
+```
+
 ### EXISTS
 
 ```sql
@@ -544,7 +582,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
 - **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
 - **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
 - **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
@@ -557,6 +594,8 @@ Sketch out a data model and queries before committing to a real database schema.
 
 - **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated subqueries in both `WHERE EXISTS (…)` and as a projected column (`SELECT EXISTS(…) AS has_x`). Inner WHERE resolves outer row columns as fallback, so standard semi-join patterns like `WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)` work out of the box.
 - **`= ANY(…)` / `<> ALL(…)`.** PostgreSQL-style `WHERE col = ANY(list)` and `WHERE col <> ALL(list)` are pre-processed to `IN` / `NOT IN`. Named slice parameters (`:ids` where `ids` is a `[]int`, `[]string`, etc.) expand element-by-element inside the list so batch-ID queries like `WHERE id = ANY(:ids)` work without any string building.
+- **Subqueries in `FROM` (derived tables).** `SELECT … FROM (SELECT …) AS sub` executes the inner SELECT first and uses its result rows as a virtual table. Works with `SELECT *`, outer `WHERE`, qualified `sub.col` references, `INNER JOIN` / `LEFT JOIN` against derived tables, `ORDER BY` / `LIMIT` inside the subquery, and nested subqueries.
+- **Subqueries in `FROM` (derived tables).** `SELECT … FROM (SELECT …) AS sub` executes the inner query first and treats the result as a virtual table. Supports `SELECT *`, outer `WHERE`, qualified `alias.col` references, `JOIN` against derived tables (including aggregated subqueries), `ORDER BY` / `LIMIT` inside the subquery, and nested derived tables.
 - **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated EXISTS subqueries work in `WHERE EXISTS (…)`, `WHERE NOT EXISTS (…)`, inside `AND` / `OR` / `NOT` compounds, and as projected columns (`SELECT EXISTS(…) AS has_x FROM t`). The inner SELECT receives the outer driving row's columns as a fallback context so correlated references like `WHERE orders.user_id = users.id` resolve without any extra syntax.
 - **UPSERT (`ON CONFLICT … DO UPDATE SET` / `DO NOTHING`).** PostgreSQL-style upsert is pre-processed and translated to the MySQL ON DUPLICATE KEY UPDATE form the parser understands. Conflict detection scans for rows matching on the specified column(s); on a hit the SET assignments are applied in place. Composite conflict keys, batch-value inserts, partial updates (updating only some columns), constant expressions in the SET clause, and the silent-skip variant (`DO NOTHING`) are all supported.
 - **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.

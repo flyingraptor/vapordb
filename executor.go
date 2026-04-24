@@ -14,8 +14,9 @@ import (
 // ─── TABLE REFERENCE HELPERS ─────────────────────────────────────────────────
 
 type tableRef struct {
-	name  string // actual table name
-	alias string // alias (equals name when no AS clause)
+	name    string // actual table name (or alias for derived tables)
+	alias   string // alias used to qualify column names in the row
+	subRows []Row  // non-nil for derived tables (subquery in FROM)
 }
 
 type joinDesc struct {
@@ -24,36 +25,79 @@ type joinDesc struct {
 	condition sqlparser.Expr // nil → cross / implicit join
 }
 
-func extractTableRef(ate *sqlparser.AliasedTableExpr) (tableRef, error) {
-	tn, ok := ate.Expr.(sqlparser.TableName)
-	if !ok {
-		return tableRef{}, fmt.Errorf("subqueries in FROM are not supported")
+// rowsForRef returns the rows for a tableRef, whether it's a real table or a
+// derived table produced by a subquery in FROM. Rows are qualified with the
+// ref alias so multi-table queries can use the alias.col notation.
+func rowsForRef(db *DB, ref tableRef, qualify bool) []Row {
+	var raw []Row
+	if ref.subRows != nil {
+		raw = ref.subRows
+	} else if tbl := db.Tables[ref.name]; tbl != nil {
+		raw = tbl.Rows
 	}
-	name := tn.Name.String()
-	alias := name
-	if !ate.As.IsEmpty() {
-		alias = ate.As.String()
+	if len(raw) == 0 {
+		return nil
 	}
-	return tableRef{name: name, alias: alias}, nil
+	out := make([]Row, len(raw))
+	for i, r := range raw {
+		if qualify {
+			out[i] = qualifyRow(r, ref.alias)
+		} else {
+			out[i] = copyRow(r)
+		}
+	}
+	return out
+}
+
+func extractTableRef(db *DB, ate *sqlparser.AliasedTableExpr) (tableRef, error) {
+	switch expr := ate.Expr.(type) {
+	case sqlparser.TableName:
+		name := expr.Name.String()
+		alias := name
+		if !ate.As.IsEmpty() {
+			alias = ate.As.String()
+		}
+		return tableRef{name: name, alias: alias}, nil
+
+	case *sqlparser.Subquery:
+		// Derived table: execute the inner SELECT now so its result rows can
+		// be used as a virtual table for the rest of the outer query.
+		inner, ok := expr.Select.(*sqlparser.Select)
+		if !ok {
+			return tableRef{}, fmt.Errorf("derived table: unsupported subquery type %T", expr.Select)
+		}
+		alias := ate.As.String()
+		if alias == "" {
+			return tableRef{}, fmt.Errorf("derived table subquery must have an alias (AS …)")
+		}
+		rows, err := execSelect(db, inner)
+		if err != nil {
+			return tableRef{}, fmt.Errorf("derived table %q: %w", alias, err)
+		}
+		return tableRef{name: alias, alias: alias, subRows: rows}, nil
+
+	default:
+		return tableRef{}, fmt.Errorf("unsupported FROM expression type: %T", ate.Expr)
+	}
 }
 
 // walkTableExpr recursively flattens a TableExpr into ordered refs and join
 // descriptors. joins[i] describes how refs[i+1] is joined to the left side.
-func walkTableExpr(te sqlparser.TableExpr) ([]tableRef, []joinDesc, error) {
+func walkTableExpr(db *DB, te sqlparser.TableExpr) ([]tableRef, []joinDesc, error) {
 	switch t := te.(type) {
 	case *sqlparser.AliasedTableExpr:
-		ref, err := extractTableRef(t)
+		ref, err := extractTableRef(db, t)
 		if err != nil {
 			return nil, nil, err
 		}
 		return []tableRef{ref}, nil, nil
 
 	case *sqlparser.JoinTableExpr:
-		leftRefs, leftJoins, err := walkTableExpr(t.LeftExpr)
+		leftRefs, leftJoins, err := walkTableExpr(db, t.LeftExpr)
 		if err != nil {
 			return nil, nil, err
 		}
-		rightRefs, rightJoins, err := walkTableExpr(t.RightExpr)
+		rightRefs, rightJoins, err := walkTableExpr(db, t.RightExpr)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -73,7 +117,7 @@ func walkTableExpr(te sqlparser.TableExpr) ([]tableRef, []joinDesc, error) {
 		var allRefs []tableRef
 		var allJoins []joinDesc
 		for _, inner := range t.Exprs {
-			refs, joins, err := walkTableExpr(inner)
+			refs, joins, err := walkTableExpr(db, inner)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -89,12 +133,12 @@ func walkTableExpr(te sqlparser.TableExpr) ([]tableRef, []joinDesc, error) {
 
 // extractFromClause collects all table refs and join descriptors from the
 // FROM clause, treating comma-separated tables as implicit cross joins.
-func extractFromClause(from sqlparser.TableExprs) ([]tableRef, []joinDesc, error) {
+func extractFromClause(db *DB, from sqlparser.TableExprs) ([]tableRef, []joinDesc, error) {
 	var allRefs []tableRef
 	var allJoins []joinDesc
 
 	for _, te := range from {
-		refs, joins, err := walkTableExpr(te)
+		refs, joins, err := walkTableExpr(db, te)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -141,8 +185,17 @@ func mergeRows(a, b Row) Row {
 }
 
 // nullRowForTable builds a row of NULLs for a table's schema, qualified with alias.
+// For derived tables (subRows != nil) it infers columns from the first result row.
 func nullRowForTable(db *DB, ref tableRef) Row {
 	out := make(Row)
+	if ref.subRows != nil {
+		if len(ref.subRows) > 0 {
+			for col := range ref.subRows[0] {
+				out[ref.alias+"."+col] = Null
+			}
+		}
+		return out
+	}
 	if tbl := db.Tables[ref.name]; tbl != nil {
 		for col := range tbl.Schema {
 			out[ref.alias+"."+col] = Null
@@ -287,7 +340,7 @@ func applyOnDup(target Row, incoming Row, onDup sqlparser.OnDup) error {
 // ─── SELECT ──────────────────────────────────────────────────────────────────
 
 func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
-	refs, joins, err := extractFromClause(stmt.From)
+	refs, joins, err := extractFromClause(db, stmt.From)
 	if err != nil {
 		return nil, err
 	}
@@ -297,21 +350,14 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 
 	isMultiTable := len(refs) > 1
 
-	// Build initial rows from the first table.
+	// Build initial rows from the first table (real or derived).
 	firstRef := refs[0]
 	var rows []Row
-	if tbl := db.Tables[firstRef.name]; tbl != nil {
-		rows = make([]Row, len(tbl.Rows))
-		for i, r := range tbl.Rows {
-			if isMultiTable {
-				rows[i] = qualifyRow(r, firstRef.alias)
-			} else {
-				rows[i] = copyRow(r)
-			}
-		}
-	} else if firstRef.name == "dual" {
+	if firstRef.name == "dual" {
 		// MySQL's implicit dummy table: SELECT expr (no real FROM clause).
 		rows = []Row{{}}
+	} else {
+		rows = rowsForRef(db, firstRef, isMultiTable)
 	}
 
 	// Apply joins.
@@ -382,13 +428,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 }
 
 func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
-	var rightRows []Row
-	if tbl := db.Tables[jd.right.name]; tbl != nil {
-		rightRows = make([]Row, len(tbl.Rows))
-		for i, r := range tbl.Rows {
-			rightRows[i] = qualifyRow(r, jd.right.alias)
-		}
-	}
+	rightRows := rowsForRef(db, jd.right, true)
 
 	isLeft := strings.Contains(jd.joinType, "left")
 	var result []Row
@@ -982,7 +1022,7 @@ func execSelectCorrelated(db *DB, ex *sqlparser.ExistsExpr, outerRow Row) ([]Row
 	if !ok {
 		return nil, fmt.Errorf("EXISTS: unsupported subquery type %T", ex.Subquery.Select)
 	}
-	refs, joins, err := extractFromClause(inner.From)
+	refs, joins, err := extractFromClause(db, inner.From)
 	if err != nil {
 		return nil, err
 	}
@@ -991,17 +1031,7 @@ func execSelectCorrelated(db *DB, ex *sqlparser.ExistsExpr, outerRow Row) ([]Row
 	}
 
 	isMultiTable := len(refs) > 1
-	var rows []Row
-	if tbl := db.Tables[refs[0].name]; tbl != nil {
-		rows = make([]Row, len(tbl.Rows))
-		for i, r := range tbl.Rows {
-			if isMultiTable {
-				rows[i] = qualifyRow(r, refs[0].alias)
-			} else {
-				rows[i] = copyRow(r)
-			}
-		}
-	}
+	rows := rowsForRef(db, refs[0], isMultiTable)
 	for _, jd := range joins {
 		if rows, err = applyJoin(db, rows, jd); err != nil {
 			return nil, err
