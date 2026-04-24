@@ -22,7 +22,7 @@ func New() *DB {
 
 // Query executes a SELECT statement and returns the matching rows.
 func (db *DB) Query(sql string) ([]Row, error) {
-	stmt, err := sqlparser.Parse(sql)
+	stmt, err := sqlparser.Parse(rewriteAnyAll(sql))
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
@@ -35,7 +35,7 @@ func (db *DB) Query(sql string) ([]Row, error) {
 
 // Exec executes an INSERT, UPDATE, or DELETE statement.
 func (db *DB) Exec(sql string) error {
-	rewritten, conflictCols, doNothing := rewriteOnConflict(sql)
+	rewritten, conflictCols, doNothing := rewriteOnConflict(rewriteAnyAll(sql))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)

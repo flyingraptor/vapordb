@@ -5,6 +5,26 @@ import (
 	"strings"
 )
 
+// ── = ANY(…) / <> ALL(…) rewriter ────────────────────────────────────────────
+
+// anyEqRE matches  = ANY(  (case-insensitive) and replaces it with  IN (
+var anyEqRE = regexp.MustCompile(`(?i)=\s*ANY\s*\(`)
+
+// allNeqRE matches  <> ALL(  or  != ALL(  and replaces with  NOT IN (
+var allNeqRE = regexp.MustCompile(`(?i)(<>|!=)\s*ALL\s*\(`)
+
+// rewriteAnyAll rewrites PostgreSQL-style set operators to standard IN / NOT IN
+// so the MySQL-dialect parser can handle them:
+//
+//	col = ANY(…)   →  col IN (…)
+//	col <> ALL(…)  →  col NOT IN (…)
+//	col != ALL(…)  →  col NOT IN (…)
+func rewriteAnyAll(sql string) string {
+	sql = anyEqRE.ReplaceAllString(sql, "IN (")
+	sql = allNeqRE.ReplaceAllString(sql, "NOT IN (")
+	return sql
+}
+
 // onConflictRE matches the PostgreSQL ON CONFLICT clause at the end of an
 // INSERT statement. Two forms are supported:
 //

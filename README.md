@@ -23,7 +23,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
 - **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
 - **Date support.** `KindDate` type backed by `time.Time`. Date literals, comparisons, BETWEEN, ORDER BY, and date functions (NOW, CURDATE, DATE, YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, DATE_FORMAT, …). String literals auto-coerce when compared against date columns.
-- **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct.
+- **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct. Slice values expand automatically, so `= ANY(:ids)` with `[]int{1,2,3}` becomes `IN (1, 2, 3)`.
 - **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
 
@@ -217,6 +217,16 @@ err = db.ExecNamed(
 
 Single-quoted string literals in the SQL are never scanned for placeholders, so values like `WHERE note = ':not_a_param'` are safe. Single quotes inside string values are automatically escaped.
 
+Slice values expand to a comma-separated literal list, making them ideal with `= ANY(:param)` / `<> ALL(:param)`:
+
+```go
+db.QueryNamed(
+    `SELECT * FROM orders WHERE id = ANY(:ids)`,
+    map[string]any{"ids": []int{10, 20, 30}},
+)
+// expands to: WHERE id IN (10, 20, 30)
+```
+
 ## Persistence
 
 ```go
@@ -371,6 +381,44 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### = ANY(…) / <> ALL(…)
+
+PostgreSQL-style set operators are rewritten to `IN` / `NOT IN` before parsing, so the MySQL-dialect parser handles them transparently.
+
+```sql
+-- equivalent to WHERE id IN (1, 2, 3)
+SELECT * FROM users WHERE id = ANY(1, 2, 3)
+
+-- equivalent to WHERE status NOT IN ('pending', 'cancelled')
+SELECT * FROM tasks WHERE status <> ALL('pending', 'cancelled')
+
+-- != ALL is also accepted
+SELECT * FROM tasks WHERE status != ALL('pending', 'cancelled')
+```
+
+The real power is combining them with named slice parameters, which avoids dynamic SQL construction entirely:
+
+```go
+rows, _ := db.QueryNamed(
+    `SELECT * FROM orders WHERE user_id = ANY(:ids)`,
+    map[string]any{"ids": []int{10, 20, 30}},
+)
+
+// also works with []string, []float64, or any slice of a supported type
+rows, _ = db.QueryNamed(
+    `SELECT * FROM products WHERE tag <> ALL(:excluded)`,
+    map[string]any{"excluded": []string{"archived", "draft"}},
+)
+
+// struct params work too
+type Filter struct {
+    IDs []int `db:"ids"`
+}
+rows, _ = db.QueryNamed(`SELECT * FROM users WHERE id = ANY(:ids)`, Filter{IDs: []int{1, 2}})
+```
+
+An empty slice expands to `IN (NULL)`, which matches no rows — a safe no-op.
+
 ### UPSERT
 
 PostgreSQL-style `ON CONFLICT` is fully supported. Conflict detection is done by value-equality on the specified column(s); no unique index is required.
@@ -469,7 +517,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **`= ANY(…)` / `<> ALL(…)` array operators** `IN` and `NOT IN` with literal lists already work. This item covers the PostgreSQL-dialect syntax `WHERE col = ANY(array)` / `WHERE col <> ALL(array)`, evaluated using the same underlying `IN` / `NOT IN` logic so batch-ID queries like `WHERE group_id = ANY(:group_ids)` work without rewriting.
 - **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
 - **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
 - **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
@@ -482,6 +529,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 **Added**
 
+- **`= ANY(…)` / `<> ALL(…)` set operators.** PostgreSQL-style `WHERE col = ANY(list)` and `WHERE col <> ALL(list)` are pre-processed to `IN` / `NOT IN`. Named slice parameters (`:ids` where `ids` is a `[]int`, `[]string`, etc.) expand element-by-element inside the list so batch-ID queries like `WHERE id = ANY(:ids)` work without any string building.
 - **UPSERT (`ON CONFLICT … DO UPDATE SET` / `DO NOTHING`).** PostgreSQL-style upsert is pre-processed and translated to the MySQL ON DUPLICATE KEY UPDATE form the parser understands. Conflict detection scans for rows matching on the specified column(s); on a hit the SET assignments are applied in place. Composite conflict keys, batch-value inserts, partial updates (updating only some columns), constant expressions in the SET clause, and the silent-skip variant (`DO NOTHING`) are all supported.
 - **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.
 - **Pointer and Stringer support in struct mapping.** `InsertStruct` now dereferences pointer fields (`*string`, `*int`, `*float64`, …) and nil pointers become NULL. Types implementing `fmt.Stringer` (e.g. `net.IP`, `uuid.UUID`) are stored using their `String()` output. `ScanRows` allocates pointer fields when the column is non-NULL and uses `encoding.TextUnmarshaler` to reconstruct custom types from their stored string form.

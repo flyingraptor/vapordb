@@ -133,6 +133,8 @@ func toParamMap(params any) (map[string]any, error) {
 }
 
 // anyToSQLLiteral converts a Go value to its SQL literal representation.
+// Slices are expanded to a comma-separated list of literals so they can be
+// used directly inside IN (…) after = ANY(:param) / <> ALL(:param) rewriting.
 func anyToSQLLiteral(v any) (string, error) {
 	if v == nil {
 		return "NULL", nil
@@ -144,6 +146,21 @@ func anyToSQLLiteral(v any) (string, error) {
 			return "NULL", nil
 		}
 		rv = rv.Elem()
+	}
+	// Slices → comma-separated literals (used inside IN (…)).
+	if rv.Kind() == reflect.Slice {
+		if rv.Len() == 0 {
+			return "NULL", nil // IN (NULL) matches nothing — safe no-op
+		}
+		parts := make([]string, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			lit, err := anyToSQLLiteral(rv.Index(i).Interface())
+			if err != nil {
+				return "", fmt.Errorf("slice element %d: %w", i, err)
+			}
+			parts[i] = lit
+		}
+		return strings.Join(parts, ", "), nil
 	}
 	switch rv.Kind() { //nolint:exhaustive
 	case reflect.String:
