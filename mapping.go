@@ -1,6 +1,8 @@
 package vapordb
 
 import (
+	"database/sql"
+	"database/sql/driver"
 	"encoding"
 	"fmt"
 	"reflect"
@@ -97,16 +99,19 @@ var (
 	timeType         = reflect.TypeOf(time.Time{})
 	stringerType     = reflect.TypeOf((*fmt.Stringer)(nil)).Elem()
 	textUnmarshaller = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
+	driverValuerType = reflect.TypeOf((*driver.Valuer)(nil)).Elem()
+	sqlScannerType   = reflect.TypeOf((*sql.Scanner)(nil)).Elem()
 )
 
 // structFieldToSQL converts a struct field value into its SQL literal.
 // Resolution order:
-//  1. Nil pointer  → NULL
-//  2. Pointer      → dereference and recurse
-//  3. time.Time    → DATE('…')
-//  4. fmt.Stringer → quoted String() result
-//  5. Primitive kinds (string, int, float, bool)
-//  6. Anything else → NULL
+//  1. Nil pointer         → NULL
+//  2. Pointer             → dereference and recurse
+//  3. time.Time           → DATE('…')
+//  4. driver.Valuer       → convert the driver.Value to a SQL literal
+//  5. fmt.Stringer        → quoted String() result
+//  6. Primitive kinds     (string, int, float, bool)
+//  7. Anything else       → NULL
 func structFieldToSQL(v reflect.Value) string {
 	// 1 & 2. Dereference pointers; nil pointer → NULL.
 	for v.Kind() == reflect.Pointer {
@@ -116,7 +121,7 @@ func structFieldToSQL(v reflect.Value) string {
 		v = v.Elem()
 	}
 
-	// 3. time.Time
+	// 3. time.Time — handle explicitly so we control the DATE(…) format.
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
 		if t.IsZero() {
@@ -125,7 +130,16 @@ func structFieldToSQL(v reflect.Value) string {
 		return fmt.Sprintf("DATE('%s')", t.UTC().Format("2006-01-02 15:04:05"))
 	}
 
-	// 4. fmt.Stringer — value receiver or pointer receiver.
+	// 4. driver.Valuer (value receiver or pointer receiver).
+	if dv, ok := valuerOf(v); ok {
+		dbVal, err := dv.Value()
+		if err != nil || dbVal == nil {
+			return "NULL"
+		}
+		return driverValueToSQL(dbVal)
+	}
+
+	// 5. fmt.Stringer — value receiver or pointer receiver.
 	if v.Type().Implements(stringerType) {
 		return quotedString(v.Interface().(fmt.Stringer).String())
 	}
@@ -133,7 +147,7 @@ func structFieldToSQL(v reflect.Value) string {
 		return quotedString(v.Addr().Interface().(fmt.Stringer).String())
 	}
 
-	// 5. Primitive kinds.
+	// 6. Primitive kinds.
 	switch v.Kind() { //nolint:exhaustive
 	case reflect.String:
 		return quotedString(v.String())
@@ -154,10 +168,11 @@ func structFieldToSQL(v reflect.Value) string {
 
 // setStructField writes a vapordb Value into a reflect.Value struct field.
 // Resolution order:
-//  1. Pointer field   → allocate, recurse into the pointed-to type
-//  2. time.Time       → parse / assign directly
-//  3. encoding.TextUnmarshaler → UnmarshalText(string value)
-//  4. Primitive kinds (string, int, float, bool)
+//  1. Pointer field              → allocate, recurse into the pointed-to type
+//  2. time.Time                  → parse / assign directly
+//  3. sql.Scanner                → Scan(val.V)
+//  4. encoding.TextUnmarshaler   → UnmarshalText(string value)
+//  5. Primitive kinds            (string, int, float, bool)
 func setStructField(field reflect.Value, val Value) {
 	// 1. Pointer field: allocate a new value and recurse.
 	if field.Kind() == reflect.Pointer {
@@ -183,9 +198,17 @@ func setStructField(field reflect.Value, val Value) {
 		return
 	}
 
-	// 3. encoding.TextUnmarshaler (e.g. uuid.UUID, net.IP, …).
 	if field.CanAddr() {
-		if tu, ok := field.Addr().Interface().(encoding.TextUnmarshaler); ok {
+		ptr := field.Addr().Interface()
+
+		// 3. sql.Scanner — the standard database/sql scanning interface.
+		if sc, ok := ptr.(sql.Scanner); ok {
+			_ = sc.Scan(val.V)
+			return
+		}
+
+		// 4. encoding.TextUnmarshaler (e.g. uuid.UUID, net.IP, …).
+		if tu, ok := ptr.(encoding.TextUnmarshaler); ok {
 			var text string
 			switch x := val.V.(type) {
 			case string:
@@ -198,7 +221,7 @@ func setStructField(field reflect.Value, val Value) {
 		}
 	}
 
-	// 4. Primitive kinds.
+	// 5. Primitive kinds.
 	switch field.Kind() { //nolint:exhaustive
 	case reflect.String:
 		field.SetString(fmt.Sprintf("%v", val.V))
@@ -228,4 +251,44 @@ func setStructField(field reflect.Value, val Value) {
 
 func quotedString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// valuerOf returns a driver.Valuer if v (or &v) implements the interface.
+func valuerOf(v reflect.Value) (driver.Valuer, bool) {
+	if v.Type().Implements(driverValuerType) {
+		return v.Interface().(driver.Valuer), true
+	}
+	if v.CanAddr() && v.Addr().Type().Implements(driverValuerType) {
+		return v.Addr().Interface().(driver.Valuer), true
+	}
+	return nil, false
+}
+
+// driverValueToSQL converts a driver.Value (one of the allowed primitive types)
+// into its SQL literal representation.
+func driverValueToSQL(v driver.Value) string {
+	switch x := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return quotedString(x)
+	case []byte:
+		return quotedString(string(x))
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case bool:
+		if x {
+			return "1"
+		}
+		return "0"
+	case time.Time:
+		if x.IsZero() {
+			return "NULL"
+		}
+		return fmt.Sprintf("DATE('%s')", x.UTC().Format("2006-01-02 15:04:05"))
+	default:
+		return quotedString(fmt.Sprintf("%v", x))
+	}
 }

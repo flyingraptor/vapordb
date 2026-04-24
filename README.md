@@ -354,7 +354,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **`driver.Valuer` / `driver.Scanner` support** Honour the standard `database/sql/driver` interfaces so custom types like `date.Date` round-trip automatically through `InsertStruct` and `ScanRows`.
 - **`ON CONFLICT … DO UPDATE SET`** (UPSERT) Parse and execute PostgreSQL-style upsert so write paths don't require a separate SELECT + conditional INSERT/UPDATE.
 - **`= ANY(…)` / `<> ALL(…)` array operators** `IN` and `NOT IN` with literal lists already work. This item covers the PostgreSQL-dialect syntax `WHERE col = ANY(array)` / `WHERE col <> ALL(array)`, evaluated using the same underlying `IN` / `NOT IN` logic so batch-ID queries like `WHERE group_id = ANY(:group_ids)` work without rewriting.
 - **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
@@ -371,6 +370,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 - **Named parameters** `db.QueryNamed(sql, params)` and `db.ExecNamed(sql, params)` accept a `map[string]any` or a struct with `db` tags. `:param` placeholders in the SQL are replaced with properly escaped literals. String literals inside single quotes are never scanned, and single quotes in values are escaped automatically.
 - **Pointer and Stringer support in struct mapping.** `InsertStruct` now dereferences pointer fields (`*string`, `*int`, `*float64`, …) and nil pointers become NULL. Types implementing `fmt.Stringer` (e.g. `net.IP`, `uuid.UUID`) are stored using their `String()` output. `ScanRows` allocates pointer fields when the column is non-NULL and uses `encoding.TextUnmarshaler` to reconstruct custom types from their stored string form.
+- **`driver.Valuer` / `sql.Scanner` support.** `InsertStruct` calls `Value()` on any field implementing `database/sql/driver.Valuer` (e.g. `sql.NullString`, `sql.NullInt64`, custom types) and converts the result to a SQL literal. `ScanRows` calls `Scan(src)` on any field implementing `database/sql.Scanner`, passing the raw stored value. This makes `sql.Null*` types and any custom type following the standard database interface contract work automatically.
 
 ### 2026-04-24
 
