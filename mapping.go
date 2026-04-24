@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // InsertStruct builds and executes an INSERT statement from a struct.
@@ -91,7 +92,17 @@ func ScanRows[T any](rows []Row) []T {
 
 // ── internal helpers ──────────────────────────────────────────────────────────
 
+var timeType = reflect.TypeOf(time.Time{})
+
 func structFieldToSQL(v reflect.Value) string {
+	// Handle time.Time before the Kind switch (it's a struct).
+	if v.Type() == timeType {
+		t := v.Interface().(time.Time)
+		if t.IsZero() {
+			return "NULL"
+		}
+		return fmt.Sprintf("DATE('%s')", t.UTC().Format("2006-01-02 15:04:05"))
+	}
 	switch v.Kind() { //nolint:exhaustive
 	case reflect.String:
 		s := strings.ReplaceAll(v.String(), "'", "''")
@@ -113,6 +124,18 @@ func structFieldToSQL(v reflect.Value) string {
 }
 
 func setStructField(field reflect.Value, val Value) {
+	// Handle time.Time fields regardless of Kind.
+	if field.Type() == timeType {
+		switch x := val.V.(type) {
+		case time.Time:
+			field.Set(reflect.ValueOf(x))
+		case string:
+			if t, ok := tryParseDate(x); ok {
+				field.Set(reflect.ValueOf(t))
+			}
+		}
+		return
+	}
 	switch field.Kind() { //nolint:exhaustive
 	case reflect.String:
 		field.SetString(fmt.Sprintf("%v", val.V))

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // Kind is the discriminant for the Value tagged union.
@@ -15,12 +16,33 @@ const (
 	KindInt    Kind = 2 // stored as int64
 	KindFloat  Kind = 3 // stored as float64
 	KindString Kind = 4
+	KindDate   Kind = 5 // stored as time.Time
 )
 
 // Value is a tagged union representing a single SQL value.
 type Value struct {
 	Kind Kind
-	V    any // nil | bool | int64 | float64 | string
+	V    any // nil | bool | int64 | float64 | string | time.Time
+}
+
+// dateFormats lists the formats tried when parsing a string as a date/datetime.
+var dateFormats = []string{
+	"2006-01-02",
+	"2006-01-02 15:04:05",
+	"2006-01-02T15:04:05",
+	time.RFC3339,
+	time.RFC3339Nano,
+}
+
+// tryParseDate tries to parse s as a date/datetime using known formats.
+// Returns the parsed time and true on success.
+func tryParseDate(s string) (time.Time, bool) {
+	for _, f := range dateFormats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // Null is the canonical null Value.
@@ -41,6 +63,8 @@ func KindOf(v any) Kind {
 		return KindFloat
 	case string:
 		return KindString
+	case time.Time:
+		return KindDate
 	}
 	return KindString
 }
@@ -78,6 +102,8 @@ func MakeValue(v any) Value {
 		return Value{Kind: KindFloat, V: x}
 	case string:
 		return Value{Kind: KindString, V: x}
+	case time.Time:
+		return Value{Kind: KindDate, V: x}
 	}
 	return Value{Kind: KindString, V: fmt.Sprintf("%v", v)}
 }
@@ -107,6 +133,10 @@ func IsConflict(existing, incoming Kind) bool {
 	if existing == incoming {
 		return false
 	}
+	// Dates are their own family; any transition to or from KindDate conflicts.
+	if existing == KindDate || incoming == KindDate {
+		return true
+	}
 	numericFamily := func(k Kind) bool {
 		return k == KindBool || k == KindInt || k == KindFloat
 	}
@@ -123,6 +153,8 @@ func IsConflict(existing, incoming Kind) bool {
 
 // Compare compares two Values. Returns -1, 0, or 1.
 // NULLs sort before all other values.
+// When one operand is KindDate the other is coerced to time.Time so that
+// string literals like '2024-01-15' compare naturally against date columns.
 func Compare(a, b Value) int {
 	if a.Kind == KindNull && b.Kind == KindNull {
 		return 0
@@ -132,6 +164,17 @@ func Compare(a, b Value) int {
 	}
 	if b.Kind == KindNull {
 		return 1
+	}
+	if a.Kind == KindDate || b.Kind == KindDate {
+		ta, tb := valueToTime(a), valueToTime(b)
+		switch {
+		case ta.Before(tb):
+			return -1
+		case ta.After(tb):
+			return 1
+		default:
+			return 0
+		}
 	}
 	if isNumericKind(a.Kind) && isNumericKind(b.Kind) {
 		fa, fb := numericFloat(a), numericFloat(b)
@@ -153,6 +196,20 @@ func Compare(a, b Value) int {
 	default:
 		return 0
 	}
+}
+
+// valueToTime extracts or parses a time.Time from a Value.
+// Used when at least one operand in a comparison is KindDate.
+func valueToTime(v Value) time.Time {
+	if t, ok := v.V.(time.Time); ok {
+		return t
+	}
+	if s, ok := v.V.(string); ok {
+		if t, ok := tryParseDate(s); ok {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 // Equal returns true if two Values are equal under SQL semantics.
@@ -186,6 +243,12 @@ func numericFloat(v Value) float64 {
 func valueString(v Value) string {
 	if v.V == nil {
 		return ""
+	}
+	if t, ok := v.V.(time.Time); ok {
+		if t.Hour() == 0 && t.Minute() == 0 && t.Second() == 0 && t.Nanosecond() == 0 {
+			return t.UTC().Format("2006-01-02")
+		}
+		return t.UTC().Format("2006-01-02 15:04:05")
 	}
 	return fmt.Sprintf("%v", v.V)
 }
@@ -238,7 +301,12 @@ type valueWire struct {
 }
 
 func (v Value) MarshalJSON() ([]byte, error) {
-	return json.Marshal(valueWire{Kind: v.Kind, V: v.V})
+	wire := valueWire{Kind: v.Kind, V: v.V}
+	if t, ok := v.V.(time.Time); ok {
+		// Serialize as RFC3339 so the kind discriminant survives a round-trip.
+		wire.V = t.UTC().Format(time.RFC3339Nano)
+	}
+	return json.Marshal(wire)
 }
 
 func (v *Value) UnmarshalJSON(data []byte) error {
@@ -286,6 +354,16 @@ func (v *Value) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		v.V = s
+	case KindDate:
+		var s string
+		if err := json.Unmarshal(raw.V, &s); err != nil {
+			return err
+		}
+		t, ok := tryParseDate(s)
+		if !ok {
+			return fmt.Errorf("decoding date: cannot parse %q", s)
+		}
+		v.V = t
 	}
 	return nil
 }

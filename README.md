@@ -21,6 +21,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Automatic schema evolution.** New columns are added on the fly. Safe type widening (e.g. `int` to `float`) happens automatically.
 - **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
+- **Date support.** `KindDate` type backed by `time.Time`. Date literals, comparisons, BETWEEN, ORDER BY, and date functions (NOW, CURDATE, DATE, YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, DATE_FORMAT, …). String literals auto-coerce when compared against date columns.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
 - **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags.
 
@@ -69,8 +70,8 @@ func main() {
 | `vapordb.ScanRows[T](rows)` | Scan `[]Row` into a typed slice |
 
 A `Row` is `map[string]Value`. Each `Value` has:
-- `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, or `nil`)
-- `.Kind` is one of `KindNull`, `KindBool`, `KindInt`, `KindFloat`, `KindString`
+- `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, `time.Time`, or `nil`)
+- `.Kind` is one of `KindNull`, `KindBool`, `KindInt`, `KindFloat`, `KindString`, `KindDate`
 
 ## Schema Inference
 
@@ -191,6 +192,58 @@ ROUND(price, 2), FLOOR(price), CEIL(price)
 CAST(age AS CHAR)
 ```
 
+### Dates
+
+Date columns are stored as `time.Time` with `KindDate`. Use the `DATE()` function to create date literals from strings, or insert `time.Time` values directly via `InsertStruct`.
+
+String literals in comparisons against date columns are automatically coerced — `WHERE created_at > '2024-01-01'` works without wrapping in `DATE()`.
+
+```sql
+-- Insert using DATE() literal
+INSERT INTO events (id, name, created_at) VALUES (1, 'launch', DATE('2024-01-15'))
+
+-- Compare and filter
+SELECT * FROM events WHERE created_at > '2024-01-01'
+SELECT * FROM events WHERE created_at BETWEEN '2024-01-01' AND '2024-12-31'
+SELECT * FROM events WHERE created_at IN ('2024-01-15', '2024-06-01')
+
+-- Order by date
+SELECT * FROM events ORDER BY created_at DESC
+
+-- Aggregate
+SELECT MIN(created_at), MAX(created_at) FROM events
+
+-- Date functions
+NOW()                              -- current datetime
+CURDATE()                          -- today at midnight UTC
+DATE(expr)                         -- truncate to date (strip time part)
+YEAR(date), MONTH(date), DAY(date) -- extract parts
+HOUR(dt), MINUTE(dt), SECOND(dt)
+DATEDIFF(d1, d2)                   -- days from d2 to d1
+DATE_ADD(date, INTERVAL 7 DAY)     -- add interval (units: SECOND MINUTE HOUR DAY WEEK MONTH YEAR)
+DATE_SUB(date, INTERVAL 1 MONTH)
+DATE_FORMAT(date, '%Y-%m-%d')      -- format with MySQL specifiers
+
+-- Filter by extracted part
+SELECT * FROM events WHERE YEAR(created_at) = 2024
+SELECT * FROM events WHERE MONTH(created_at) = 12
+```
+
+**Struct mapping** — tag `time.Time` fields with `db` and they round-trip automatically:
+
+```go
+type Event struct {
+    ID        int       `db:"id"`
+    Name      string    `db:"name"`
+    CreatedAt time.Time `db:"created_at"`
+}
+
+db.InsertStruct("events", Event{ID: 1, Name: "launch", CreatedAt: time.Now()})
+
+rows, _ := db.Query(`SELECT * FROM events WHERE created_at > '2024-01-01'`)
+events := vapordb.ScanRows[Event](rows)
+```
+
 ### CASE
 
 ```sql
@@ -266,3 +319,16 @@ Sketch out a data model and queries before committing to a real database schema.
 - No foreign key constraints. Model relations with JOINs.
 - No concurrent write safety. Use a `sync.RWMutex` if sharing across goroutines.
 - MySQL SQL dialect (via `github.com/xwb1989/sqlparser`)
+
+## Roadmap
+
+- [ ] **Named parameters** `db.QueryNamed(sql, params)` / `db.ExecNamed(sql, params)` accepting a struct or `map[string]any` with `:param` substitution (sqlx-style). Unlocks real-world query files without rewriting every literal.
+- [ ] **`fmt.Stringer` / pointer support in struct mapping** Dereference pointer fields (`*time.Time`, `*string`, …) and call `.String()` on types like `uuid.UUID` so `InsertStruct` and `ScanRows` handle them correctly instead of falling back to NULL.
+- [ ] **`driver.Valuer` / `driver.Scanner` support** Honour the standard `database/sql/driver` interfaces so custom types like `date.Date` round-trip automatically through `InsertStruct` and `ScanRows`.
+- [ ] **`ON CONFLICT … DO UPDATE SET`** (UPSERT) Parse and execute PostgreSQL-style upsert so write paths don't require a separate SELECT + conditional INSERT/UPDATE.
+- [ ] **`= ANY(…)` / `<> ALL(…)` array operators** `IN` and `NOT IN` with literal lists already work. This item covers the PostgreSQL-dialect syntax `WHERE col = ANY(array)` / `WHERE col <> ALL(array)`, evaluated using the same underlying `IN` / `NOT IN` logic so batch-ID queries like `WHERE group_id = ANY(:group_ids)` work without rewriting.
+- [ ] **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
+- [ ] **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
+- [ ] **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
+- [ ] **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
+- [ ] **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.

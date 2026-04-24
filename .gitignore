@@ -1,6 +1,9 @@
 # playground — local experiment, not part of the library
 cmd/
 
+# local example models — not part of the library
+example models/
+
 # binaries
 /vapordb
 
