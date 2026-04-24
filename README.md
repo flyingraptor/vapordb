@@ -322,13 +322,41 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- [ ] **Named parameters** `db.QueryNamed(sql, params)` / `db.ExecNamed(sql, params)` accepting a struct or `map[string]any` with `:param` substitution (sqlx-style). Unlocks real-world query files without rewriting every literal.
-- [ ] **`fmt.Stringer` / pointer support in struct mapping** Dereference pointer fields (`*time.Time`, `*string`, …) and call `.String()` on types like `uuid.UUID` so `InsertStruct` and `ScanRows` handle them correctly instead of falling back to NULL.
-- [ ] **`driver.Valuer` / `driver.Scanner` support** Honour the standard `database/sql/driver` interfaces so custom types like `date.Date` round-trip automatically through `InsertStruct` and `ScanRows`.
-- [ ] **`ON CONFLICT … DO UPDATE SET`** (UPSERT) Parse and execute PostgreSQL-style upsert so write paths don't require a separate SELECT + conditional INSERT/UPDATE.
-- [ ] **`= ANY(…)` / `<> ALL(…)` array operators** `IN` and `NOT IN` with literal lists already work. This item covers the PostgreSQL-dialect syntax `WHERE col = ANY(array)` / `WHERE col <> ALL(array)`, evaluated using the same underlying `IN` / `NOT IN` logic so batch-ID queries like `WHERE group_id = ANY(:group_ids)` work without rewriting.
-- [ ] **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
-- [ ] **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
-- [ ] **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
-- [ ] **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
-- [ ] **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
+- **Named parameters** `db.QueryNamed(sql, params)` / `db.ExecNamed(sql, params)` accepting a struct or `map[string]any` with `:param` substitution (sqlx-style). Unlocks real-world query files without rewriting every literal.
+- **`fmt.Stringer` / pointer support in struct mapping** Dereference pointer fields (`*time.Time`, `*string`, …) and call `.String()` on types like `uuid.UUID` so `InsertStruct` and `ScanRows` handle them correctly instead of falling back to NULL.
+- **`driver.Valuer` / `driver.Scanner` support** Honour the standard `database/sql/driver` interfaces so custom types like `date.Date` round-trip automatically through `InsertStruct` and `ScanRows`.
+- **`ON CONFLICT … DO UPDATE SET`** (UPSERT) Parse and execute PostgreSQL-style upsert so write paths don't require a separate SELECT + conditional INSERT/UPDATE.
+- **`= ANY(…)` / `<> ALL(…)` array operators** `IN` and `NOT IN` with literal lists already work. This item covers the PostgreSQL-dialect syntax `WHERE col = ANY(array)` / `WHERE col <> ALL(array)`, evaluated using the same underlying `IN` / `NOT IN` logic so batch-ID queries like `WHERE group_id = ANY(:group_ids)` work without rewriting.
+- **`SELECT EXISTS (subquery)`** Evaluate a correlated or uncorrelated subquery in the EXISTS position, returning a bool. Needed for existence-check queries.
+- **Subqueries in `FROM`** `SELECT * FROM (SELECT …) AS sub` — derived tables. A stepping stone toward CTEs and more expressive queries.
+- **`UNION` / `UNION ALL`** Combining result sets from multiple SELECTs. Common for reporting and fan-out queries.
+- **CTEs (`WITH … AS (…) SELECT …`)** Nearly every complex query in a real codebase uses them for readability and reuse. Also a prerequisite for recursive queries.
+- **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
+
+## Changelog
+
+### 2026-04-24
+
+**Added**
+
+- **Date support** (`KindDate`) backed by `time.Time`.
+  - `DATE(expr)` parses a string literal into a date value.
+  - Comparison operators (`>`, `<`, `>=`, `<=`, `=`, `<>`) against date columns; string literals are automatically coerced when one operand is `KindDate`.
+  - `BETWEEN` / `NOT BETWEEN`, `ORDER BY`, `MIN`, `MAX`, `IN` on date columns.
+  - Date functions: `NOW()`, `CURDATE()`, `DATE()`, `YEAR()`, `MONTH()`, `DAY()`, `HOUR()`, `MINUTE()`, `SECOND()`, `WEEKDAY()`, `DAYOFWEEK()`, `DATEDIFF()`, `TIMESTAMPDIFF()`, `DATE_FORMAT()`, `DATE_ADD()`, `DATE_SUB()`.
+  - `time.Time` fields in structs round-trip through `InsertStruct` and `ScanRows` automatically.
+  - `KindDate` values persist correctly through `Save` / `Load`.
+  - Expression-only `SELECT` without a real table (e.g. `SELECT NOW()`) supported via `FROM DUAL`.
+- **NULL propagation fix for `NOT BETWEEN`** A NULL left operand now correctly returns false for both `BETWEEN` and `NOT BETWEEN`, matching standard SQL semantics.
+
+### Initial release
+
+- In-memory SQL engine with automatic schema inference and safe type widening.
+- `SELECT` with `WHERE`, `JOIN` (INNER, LEFT), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`.
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` (including `COUNT(DISTINCT …)`).
+- Predicates: `=`, `<>`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `IN`, `NOT IN`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`, `IS TRUE`, `IS FALSE`, `AND`, `OR`, `NOT`.
+- Scalar functions: `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `CONCAT`, `COALESCE`, `IFNULL`, `NULLIF`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `CAST`.
+- `CASE` / `WHEN` / `ELSE` expressions and arithmetic operators.
+- `INSERT`, `UPDATE`, `DELETE`.
+- `db.InsertStruct` and `vapordb.ScanRows[T]` for struct-based data access via `db` tags.
+- `db.Save` / `db.Load` for JSON persistence.
