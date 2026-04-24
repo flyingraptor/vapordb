@@ -26,11 +26,25 @@ func (db *DB) Query(sql string) ([]Row, error) {
 	if err != nil {
 		return nil, err
 	}
+	mainSQL, winSpecs, err := extractWindowFuncs(mainSQL)
+	if err != nil {
+		return nil, err
+	}
 	stmt, err := sqlparser.Parse(rewriteAnyAll(mainSQL))
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	return execSelectStatement(target, stmt)
+	rows, err := execSelectStatement(target, stmt)
+	if err != nil {
+		return nil, err
+	}
+	if len(winSpecs) > 0 {
+		rows, err = applyWindowFuncs(rows, winSpecs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
 }
 
 // execSelectStatement dispatches a parsed statement to execSelect or execUnion.

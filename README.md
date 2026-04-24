@@ -22,6 +22,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
 - **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
+- **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX` with `OVER([PARTITION BY …] [ORDER BY …])`.
 - **CTEs (`WITH … AS (…) SELECT …`).** One or more named subqueries before the main SELECT. Later CTEs can reference earlier ones. CTE names act as virtual tables for the main query, `JOIN`s, `EXISTS` subqueries, and derived tables.
 - **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs, with optional `ORDER BY` / `LIMIT` on the combined result.
 - **Subqueries in `FROM`.** `SELECT … FROM (SELECT …) AS sub` — derived tables, including joins against derived tables and nested subqueries.
@@ -385,6 +386,53 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### Window Functions
+
+Window functions compute a value for each row based on a related set of rows (the window), without collapsing rows the way `GROUP BY` does.
+
+```sql
+-- Total row count alongside every row (pagination pattern)
+SELECT id, name, COUNT(*) OVER() AS total FROM users ORDER BY id
+
+-- Sequential row number ordered by id
+SELECT id, name, ROW_NUMBER() OVER(ORDER BY id) AS rn FROM users
+
+-- Rank with gaps for tied values (1, 2, 2, 4 …)
+SELECT id, score, RANK() OVER(ORDER BY score DESC) AS rnk FROM scores
+
+-- Dense rank without gaps (1, 2, 2, 3 …)
+SELECT id, score, DENSE_RANK() OVER(ORDER BY score DESC) AS dr FROM scores
+
+-- Per-department row number ordered by salary descending
+SELECT dept, name, salary,
+       ROW_NUMBER() OVER(PARTITION BY dept ORDER BY salary DESC) AS dept_rn
+FROM employees
+
+-- Department salary totals alongside every row
+SELECT dept, name, salary,
+       SUM(salary) OVER(PARTITION BY dept) AS dept_total,
+       AVG(salary) OVER(PARTITION BY dept) AS dept_avg,
+       MAX(salary) OVER(PARTITION BY dept) AS dept_max
+FROM employees
+
+-- Count rows per partition
+SELECT dept, name, COUNT(*) OVER(PARTITION BY dept) AS dept_size FROM employees
+```
+
+Supported functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
+
+Window functions work inside CTEs, after `WHERE`, and can be mixed freely with other columns.
+
+```sql
+-- Top earner per department using a CTE
+WITH ranked AS (
+  SELECT dept, name, salary,
+         RANK() OVER(PARTITION BY dept ORDER BY salary DESC) AS rnk
+  FROM employees
+)
+SELECT dept, name, salary FROM ranked WHERE rnk = 1
+```
+
 ### CTEs (Common Table Expressions)
 
 ```sql
@@ -661,9 +709,15 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **Window functions** `COUNT(*) OVER()` and similar for pagination total-count patterns. Low priority; can be worked around with a separate `COUNT(*)` query.
+- `RETURNING` clause for `INSERT` / `UPDATE` / `DELETE`
 
 ## Changelog
+
+### 2026-04-25 (second)
+
+**Added**
+
+- **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, and `MAX(col)` with `OVER([PARTITION BY …] [ORDER BY …])`. Implemented via pre-processing: window expressions are extracted before the SQL parser sees the query, executed as placeholder columns, and replaced with computed values on the result rows. Aggregate window functions (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`) return the same value for every row in the partition. Ranking functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`) return per-row positions according to the OVER ORDER BY. Columns referenced in `PARTITION BY`, `ORDER BY`, and the function argument do not need to be present in the outer `SELECT` list. Window functions compose with `WHERE`, `GROUP BY`, `HAVING`, `JOIN`, `UNION`, and CTEs.
 
 ### 2026-04-25
 
