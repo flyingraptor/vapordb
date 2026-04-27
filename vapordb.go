@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/xwb1989/sqlparser"
@@ -21,6 +22,37 @@ type DB struct {
 // New creates an empty database.
 func New() *DB {
 	return &DB{Tables: make(map[string]*Table)}
+}
+
+// DeclareEnum registers an allowed-value constraint for a column in table.
+// Any INSERT or UPDATE that sets the column to a value outside the declared set
+// returns an error. NULL is always accepted.
+//
+// Calling DeclareEnum again for the same column adds new variants to the set
+// (widening); existing variants are never removed automatically.
+//
+// DeclareEnum can be called before the table exists; the constraint will be
+// enforced once rows are written.
+func (db *DB) DeclareEnum(table, column string, values ...string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	tableName := strings.ToLower(table)
+	colName := strings.ToLower(column)
+
+	tbl, exists := db.Tables[tableName]
+	if !exists {
+		tbl = &Table{
+			Schema:   make(map[string]Kind),
+			EnumSets: make(map[string][]string),
+			Rows:     make([]Row, 0),
+		}
+		db.Tables[tableName] = tbl
+	}
+	if tbl.EnumSets == nil {
+		tbl.EnumSets = make(map[string][]string)
+	}
+	tbl.EnumSets[colName] = mergeEnumValues(tbl.EnumSets[colName], values)
 }
 
 // Query executes a SELECT, UNION, WITH (CTE), or DML with RETURNING and returns rows.

@@ -320,6 +320,13 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 			row[cols[i]] = val
 		}
 
+		// Validate enum constraints before touching the schema.
+		if existing := db.Tables[tableName]; existing != nil {
+			if err := validateEnum(existing, row); err != nil {
+				return err
+			}
+		}
+
 		// ── Upsert path ──────────────────────────────────────────────────────
 		if len(conflictCols) > 0 {
 			UpsertSchema(db, tableName, row)
@@ -331,6 +338,10 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 				}
 				// Apply ON DUPLICATE KEY UPDATE assignments.
 				if err := applyOnDup(tbl.Rows[idx], row, stmt.OnDup); err != nil {
+					return err
+				}
+				// Re-validate after the update assignments.
+				if err := validateEnum(tbl, tbl.Rows[idx]); err != nil {
 					return err
 				}
 				continue
@@ -1020,6 +1031,9 @@ func execUpdate(db *DB, stmt *sqlparser.Update) error {
 			val, err := evalExpr(upd.Expr, row)
 			if err != nil {
 				return fmt.Errorf("evaluating SET %s: %w", col, err)
+			}
+			if err := validateEnumColumn(tbl, col, val); err != nil {
+				return err
 			}
 			tbl.Rows[i][col] = val
 			// Evolve schema (no wipe on UPDATE — just widen or accept new type).

@@ -33,6 +33,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Date support.** `KindDate` type backed by `time.Time`. Date literals, comparisons, BETWEEN, ORDER BY, and date functions (NOW, CURDATE, DATE, YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, DATE_FORMAT, …). String literals auto-coerce when compared against date columns.
 - **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct. Slice values expand automatically, so `= ANY(:ids)` with `[]int{1,2,3}` becomes `IN (1, 2, 3)`.
 - **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
+- **Enum constraints.** `db.DeclareEnum(table, col, vals...)` restricts a column to a declared set of string values. INSERTs and UPDATEs that supply a value outside the set are rejected with an error. Calling `DeclareEnum` again on the same column widens the set (new variants are added; existing ones are never removed). NULL is always accepted. Constraints survive `Save` / `Load`.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
 
 ## Installation
@@ -80,6 +81,7 @@ func main() {
 | `vapordb.ScanRows[T](rows)` | Scan `[]Row` into a typed slice |
 | `db.QueryNamed(sql, params)` | SELECT with named `:param` placeholders |
 | `db.ExecNamed(sql, params)` | INSERT/UPDATE/DELETE with named `:param` placeholders |
+| `db.DeclareEnum(table, col, vals...)` | Restrict a column to a fixed set of string values |
 
 A `Row` is `map[string]Value`. Each `Value` has:
 - `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, `time.Time`, or `nil`)
@@ -743,8 +745,6 @@ Sketch out a data model and queries before committing to a real database schema.
 
 - **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`. Note: full JSON query languages such as PostgreSQL's `jsonpath` (`@@`, `@?`) or MySQL's `JSON_TABLE` are out of scope — only the basic operators listed above will be supported.
 
-- **`ENUM` type support.** Recognise `ENUM(...)` column definitions in both MySQL and PostgreSQL syntax and store the allowed values alongside the column schema. Inserts or updates that provide a value not in the declared set return an error. The enum set widens automatically (new variants are added) but never narrows on its own; narrowing requires an explicit schema change.
-
 - **Schema locking.** Freeze a table's schema once it stabilises, while leaving other tables free to keep evolving.
   - `db.LockSchema()` / `db.UnlockSchema()` — freeze or thaw every table at once.
   - `db.LockTable("name")` / `db.UnlockTable("name")` — per-table granularity.
@@ -752,6 +752,12 @@ Sketch out a data model and queries before committing to a real database schema.
   - Lock state persists through `Save` / `Load`.
 
 ## Changelog
+
+### 2026-04-27 (second)
+
+**Added**
+
+- **Enum constraints.** `db.DeclareEnum(table, col, vals...)` registers an allowed-value constraint on any string column. INSERTs and UPDATEs that supply a value outside the declared set return an error. NULL is always accepted. Calling `DeclareEnum` again widens the set — new variants are appended, existing ones are never removed. Constraints are stored in `Table.EnumSets` and round-trip transparently through `Save` / `Load`.
 
 ### 2026-04-27
 
