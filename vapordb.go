@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/xwb1989/sqlparser"
 )
@@ -15,8 +16,9 @@ import (
 // DB is the top-level in-memory database.
 // All public methods are safe for concurrent use by multiple goroutines.
 type DB struct {
-	mu     sync.RWMutex
-	Tables map[string]*Table
+	mu      sync.RWMutex
+	Tables  map[string]*Table
+	logPath string // set by Save/Load; empty means no query logging
 }
 
 // New creates an empty database.
@@ -105,17 +107,26 @@ func (db *DB) DeclareEnum(table, column string, values ...string) {
 //	db.Query(`INSERT INTO t (id, name) VALUES (1, 'alice') RETURNING *`)
 //	db.Query(`UPDATE t SET name = 'bob' WHERE id = 1 RETURNING id, name`)
 //	db.Query(`DELETE FROM t WHERE id = 1 RETURNING id`)
-func (db *DB) Query(sql string) ([]Row, error) {
+func (db *DB) Query(sql string) (rows []Row, retErr error) {
+	start := time.Now()
 	// Choose locking strategy before acquiring any lock: DML+RETURNING mutates
 	// the database and requires an exclusive write lock; pure SELECTs only need
 	// a shared read lock so multiple concurrent reads can proceed in parallel.
-	if _, _, hasDML := extractReturning(sql); hasDML {
+	_, _, hasDML := extractReturning(sql)
+	if hasDML {
 		db.mu.Lock()
-		defer db.mu.Unlock()
 	} else {
 		db.mu.RLock()
-		defer db.mu.RUnlock()
 	}
+	logPath := db.logPath
+	defer func() {
+		if hasDML {
+			db.mu.Unlock()
+		} else {
+			db.mu.RUnlock()
+		}
+		appendQueryLog(logPath, "query", sql, len(rows), time.Since(start), retErr)
+	}()
 
 	target, mainSQL, err := resolveCTEs(db, sql)
 	if err != nil {
@@ -135,7 +146,7 @@ func (db *DB) Query(sql string) ([]Row, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	rows, err := execSelectStatement(target, stmt)
+	rows, err = execSelectStatement(target, stmt)
 	if err != nil {
 		return nil, err
 	}
@@ -161,9 +172,14 @@ func execSelectStatement(db *DB, stmt sqlparser.Statement) ([]Row, error) {
 }
 
 // Exec executes an INSERT, UPDATE, DELETE, or WITH … SELECT statement.
-func (db *DB) Exec(sql string) error {
+func (db *DB) Exec(sql string) (retErr error) {
+	start := time.Now()
 	db.mu.Lock()
-	defer db.mu.Unlock()
+	logPath := db.logPath
+	defer func() {
+		db.mu.Unlock()
+		appendQueryLog(logPath, "exec", sql, 0, time.Since(start), retErr)
+	}()
 
 	target, mainSQL, err := resolveCTEs(db, sql)
 	if err != nil {
@@ -201,6 +217,9 @@ type dbState struct {
 }
 
 // Save serialises the entire database to a JSON file at path.
+// After a successful save, all subsequent Query and Exec calls are appended
+// to a companion query-log file at the same location
+// (e.g. "db.json" → "db_queries.jsonl").
 func (db *DB) Save(path string) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
@@ -212,10 +231,12 @@ func (db *DB) Save(path string) error {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
+	db.logPath = logPathFor(path)
 	return nil
 }
 
 // Load restores the database from a JSON file previously created by Save.
+// Like Save, it enables the query log at the companion path.
 func (db *DB) Load(path string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -232,5 +253,6 @@ func (db *DB) Load(path string) error {
 	if db.Tables == nil {
 		db.Tables = make(map[string]*Table)
 	}
+	db.logPath = logPathFor(path)
 	return nil
 }

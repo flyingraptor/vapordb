@@ -35,6 +35,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
 - **Enum constraints.** `db.DeclareEnum(table, col, vals...)` restricts a column to a declared set of string values. INSERTs and UPDATEs that supply a value outside the set are rejected with an error. Calling `DeclareEnum` again on the same column widens the set (new variants are added; existing ones are never removed). NULL is always accepted. Constraints survive `Save` / `Load`.
 - **Schema locking.** `db.LockTable(name)` / `db.LockSchema()` freeze a table's schema. Any INSERT that would add a new column, widen a type, or trigger an unsafe type change is rejected with an error. `db.UnlockTable` / `db.UnlockSchema` re-enable evolution. Lock state persists through `Save` / `Load`.
+- **Query log.** After the first `db.Save("db.json")` or `db.Load("db.json")`, every `Exec` and `Query` call is automatically appended to a companion `db_queries.jsonl` file (JSON Lines). Each entry records the timestamp, operation, SQL, duration in ms, row count, and any error. Zero setup — the log starts automatically alongside the snapshot.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
 
 ## Installation
@@ -748,9 +749,17 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
+- **Migration script generation.** `db.GenerateDDL(dialect)` inspects the live schema and emits a `CREATE TABLE` script (and `DeclareEnum` calls for enum-constrained columns) that captures everything vapordb has inferred. Supported dialects: `"mysql"` and `"postgres"`. The output is ready to paste into a real database, closing the loop from rapid prototyping to production schema.
+
 - **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`. Note: full JSON query languages such as PostgreSQL's `jsonpath` (`@@`, `@?`) or MySQL's `JSON_TABLE` are out of scope — only the basic operators listed above will be supported.
 
 ## Changelog
+
+### 2026-04-27 (fourth)
+
+**Added**
+
+- **Query log.** After `db.Save(path)` or `db.Load(path)`, all subsequent `Exec` and `Query` calls are appended in real time to a companion JSON Lines file (e.g. `db.json` → `db_queries.jsonl`). Each entry contains `ts`, `op` (`"exec"` or `"query"`), `sql`, `duration_ms`, `rows` (for queries), and `error` (when the call fails). The log is append-only and grows across multiple saves. No configuration required — logging starts automatically once a path is known.
 
 ### 2026-04-27 (third)
 
