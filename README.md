@@ -741,6 +741,8 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
+- **`ENUM` type support.** Recognise `ENUM(...)` column definitions in both MySQL and PostgreSQL syntax and store the allowed values alongside the column schema. Inserts or updates that provide a value not in the declared set return an error. The enum set widens automatically (new variants are added) but never narrows on its own; narrowing requires an explicit schema change.
+
 - **Schema locking.** Freeze a table's schema once it stabilises, while leaving other tables free to keep evolving.
   - `db.LockSchema()` / `db.UnlockSchema()` — freeze or thaw every table at once.
   - `db.LockTable("name")` / `db.UnlockTable("name")` — per-table granularity.
