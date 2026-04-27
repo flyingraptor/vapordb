@@ -7,5 +7,6 @@ type Row map[string]Value
 type Table struct {
 	Schema   map[string]Kind     `json:"schema"`
 	EnumSets map[string][]string `json:"enum_sets,omitempty"` // col → allowed values
+	Locked   bool                `json:"locked,omitempty"`    // true → schema is frozen
 	Rows     []Row               `json:"rows"`
 }

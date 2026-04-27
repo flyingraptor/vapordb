@@ -329,7 +329,9 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 
 		// ── Upsert path ──────────────────────────────────────────────────────
 		if len(conflictCols) > 0 {
-			UpsertSchema(db, tableName, row)
+			if err := UpsertSchema(db, tableName, row); err != nil {
+				return err
+			}
 			tbl := db.Tables[tableName]
 			if idx := findConflict(tbl, conflictCols, row); idx >= 0 {
 				// Conflict found.
@@ -348,7 +350,9 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 			}
 		}
 		// ── Normal insert ────────────────────────────────────────────────────
-		UpsertSchema(db, tableName, row)
+		if err := UpsertSchema(db, tableName, row); err != nil {
+			return err
+		}
 		tbl := db.Tables[tableName]
 		for col := range tbl.Schema {
 			if _, exists := row[col]; !exists {

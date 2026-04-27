@@ -24,6 +24,48 @@ func New() *DB {
 	return &DB{Tables: make(map[string]*Table)}
 }
 
+// LockSchema freezes the schema of every table that currently exists in the
+// database. Subsequent INSERTs that would add a new column, widen a type, or
+// trigger an unsafe type change on any of those tables will return an error.
+// Tables created after LockSchema is called are not affected.
+func (db *DB) LockSchema() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, tbl := range db.Tables {
+		tbl.Locked = true
+	}
+}
+
+// UnlockSchema thaws the schema of every table in the database, re-enabling
+// automatic schema evolution.
+func (db *DB) UnlockSchema() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, tbl := range db.Tables {
+		tbl.Locked = false
+	}
+}
+
+// LockTable freezes the schema of a single named table. If the table does not
+// exist the call is a no-op.
+func (db *DB) LockTable(name string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if tbl, ok := db.Tables[strings.ToLower(name)]; ok {
+		tbl.Locked = true
+	}
+}
+
+// UnlockTable thaws the schema of a single named table. If the table does not
+// exist the call is a no-op.
+func (db *DB) UnlockTable(name string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if tbl, ok := db.Tables[strings.ToLower(name)]; ok {
+		tbl.Locked = false
+	}
+}
+
 // DeclareEnum registers an allowed-value constraint for a column in table.
 // Any INSERT or UPDATE that sets the column to a value outside the declared set
 // returns an error. NULL is always accepted.

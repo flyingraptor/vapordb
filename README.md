@@ -34,6 +34,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct. Slice values expand automatically, so `= ANY(:ids)` with `[]int{1,2,3}` becomes `IN (1, 2, 3)`.
 - **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
 - **Enum constraints.** `db.DeclareEnum(table, col, vals...)` restricts a column to a declared set of string values. INSERTs and UPDATEs that supply a value outside the set are rejected with an error. Calling `DeclareEnum` again on the same column widens the set (new variants are added; existing ones are never removed). NULL is always accepted. Constraints survive `Save` / `Load`.
+- **Schema locking.** `db.LockTable(name)` / `db.LockSchema()` freeze a table's schema. Any INSERT that would add a new column, widen a type, or trigger an unsafe type change is rejected with an error. `db.UnlockTable` / `db.UnlockSchema` re-enable evolution. Lock state persists through `Save` / `Load`.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
 
 ## Installation
@@ -82,6 +83,10 @@ func main() {
 | `db.QueryNamed(sql, params)` | SELECT with named `:param` placeholders |
 | `db.ExecNamed(sql, params)` | INSERT/UPDATE/DELETE with named `:param` placeholders |
 | `db.DeclareEnum(table, col, vals...)` | Restrict a column to a fixed set of string values |
+| `db.LockSchema()` | Freeze every table's schema at once |
+| `db.UnlockSchema()` | Thaw every table's schema at once |
+| `db.LockTable(name)` | Freeze a single table's schema |
+| `db.UnlockTable(name)` | Thaw a single table's schema |
 
 A `Row` is `map[string]Value`. Each `Value` has:
 - `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, `time.Time`, or `nil`)
@@ -745,13 +750,13 @@ Sketch out a data model and queries before committing to a real database schema.
 
 - **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`. Note: full JSON query languages such as PostgreSQL's `jsonpath` (`@@`, `@?`) or MySQL's `JSON_TABLE` are out of scope — only the basic operators listed above will be supported.
 
-- **Schema locking.** Freeze a table's schema once it stabilises, while leaving other tables free to keep evolving.
-  - `db.LockSchema()` / `db.UnlockSchema()` — freeze or thaw every table at once.
-  - `db.LockTable("name")` / `db.UnlockTable("name")` — per-table granularity.
-  - A locked table rejects any INSERT that would add a new column or widen a type, returning an error instead of mutating the schema.
-  - Lock state persists through `Save` / `Load`.
-
 ## Changelog
+
+### 2026-04-27 (third)
+
+**Added**
+
+- **Schema locking.** `db.LockTable(name)` freezes the schema of a single table. `db.LockSchema()` freezes every currently existing table at once. A locked table rejects any INSERT that would add a new column, widen a type, or cause an unsafe type change — returning a descriptive error instead of mutating the schema. `db.UnlockTable` / `db.UnlockSchema` re-enable evolution. Tables created after `LockSchema()` are not affected. Lock state is stored in `Table.Locked` and persists through `Save` / `Load`.
 
 ### 2026-04-27 (second)
 
