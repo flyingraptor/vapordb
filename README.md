@@ -15,6 +15,8 @@ db.Exec(`INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)`)
 rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 ```
 
+![vapordb architecture](vapordb_diagram.png)
+
 ## Features
 
 - **Zero setup.** No CREATE TABLE, no migrations. Schema is inferred from the first INSERT.

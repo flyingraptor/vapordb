@@ -1,0 +1,18 @@
+flowchart LR
+    code["Your Go code\n(goroutine-safe)"]
+
+    subgraph vapordb["vapordb (in-process)"]
+        direction TB
+        infer["Schema Inference\nauto-evolves on INSERT\nnew columns appear on demand"]
+        tables[("In-memory Tables\nschema + rows")]
+        engine["SQL Engine\nSELECT · JOIN · GROUP BY · HAVING\nWINDOW · CTE · UNION · UPSERT\nRETURNING · subqueries · EXISTS"]
+        json[["JSON file\n(optional)"]]
+
+        infer --> tables
+        engine <--> tables
+        tables <-->|Save / Load| json
+    end
+
+    code -->|"Exec  INSERT / UPDATE / DELETE"| infer
+    code -->|"Query  SELECT"| engine
+    engine -->|"[]Row"| code
