@@ -691,13 +691,10 @@ db.Exec(`
 
 **Microservice with lightweight local state**
 
-Load once at startup, query in handlers, save after mutations. No external database required.
+Load once at startup, query in handlers, save after mutations. No external database required. All methods are safe for concurrent use — no extra locking needed.
 
 ```go
-var (
-    db *vapordb.DB
-    mu sync.RWMutex
-)
+var db *vapordb.DB
 
 func main() {
     db = vapordb.New()
@@ -707,9 +704,7 @@ func main() {
 }
 
 func handleUsers(w http.ResponseWriter, r *http.Request) {
-    mu.RLock()
     rows, _ := db.Query(`SELECT id, name FROM users`)
-    mu.RUnlock()
     // ...
 }
 ```
@@ -740,14 +735,23 @@ Sketch out a data model and queries before committing to a real database schema.
 - No transactions or rollback
 - No indexes. All queries do a full table scan.
 - No foreign key constraints. Model relations with JOINs.
-- No concurrent write safety. Use a `sync.RWMutex` if sharing across goroutines.
 - MySQL SQL dialect (via `github.com/xwb1989/sqlparser`)
 
 ## Roadmap
 
-- `RETURNING` clause for `INSERT` / `UPDATE` / `DELETE`
+- **Schema locking.** Freeze a table's schema once it stabilises, while leaving other tables free to keep evolving.
+  - `db.LockSchema()` / `db.UnlockSchema()` — freeze or thaw every table at once.
+  - `db.LockTable("name")` / `db.UnlockTable("name")` — per-table granularity.
+  - A locked table rejects any INSERT that would add a new column or widen a type, returning an error instead of mutating the schema.
+  - Lock state persists through `Save` / `Load`.
 
 ## Changelog
+
+### 2026-04-27
+
+**Added**
+
+- **Goroutine safety.** `DB` now embeds a `sync.RWMutex`. All public methods (`Query`, `Exec`, `QueryNamed`, `ExecNamed`, `Save`, `Load`) are safe for concurrent use without any external locking. `Query` with a pure SELECT acquires a shared read lock so multiple goroutines can read in parallel; `Query` with a `RETURNING` clause, `Exec`, and `Load` acquire an exclusive write lock; `Save` acquires a shared read lock.
 
 ### 2026-04-25 (second)
 

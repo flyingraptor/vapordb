@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/xwb1989/sqlparser"
 )
 
 // DB is the top-level in-memory database.
+// All public methods are safe for concurrent use by multiple goroutines.
 type DB struct {
+	mu     sync.RWMutex
 	Tables map[string]*Table
 }
 
@@ -29,6 +32,17 @@ func New() *DB {
 //	db.Query(`UPDATE t SET name = 'bob' WHERE id = 1 RETURNING id, name`)
 //	db.Query(`DELETE FROM t WHERE id = 1 RETURNING id`)
 func (db *DB) Query(sql string) ([]Row, error) {
+	// Choose locking strategy before acquiring any lock: DML+RETURNING mutates
+	// the database and requires an exclusive write lock; pure SELECTs only need
+	// a shared read lock so multiple concurrent reads can proceed in parallel.
+	if _, _, hasDML := extractReturning(sql); hasDML {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+	} else {
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+	}
+
 	target, mainSQL, err := resolveCTEs(db, sql)
 	if err != nil {
 		return nil, err
@@ -74,6 +88,9 @@ func execSelectStatement(db *DB, stmt sqlparser.Statement) ([]Row, error) {
 
 // Exec executes an INSERT, UPDATE, DELETE, or WITH … SELECT statement.
 func (db *DB) Exec(sql string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	target, mainSQL, err := resolveCTEs(db, sql)
 	if err != nil {
 		return err
@@ -111,6 +128,9 @@ type dbState struct {
 
 // Save serialises the entire database to a JSON file at path.
 func (db *DB) Save(path string) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	data, err := json.MarshalIndent(dbState{Tables: db.Tables}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -123,6 +143,9 @@ func (db *DB) Save(path string) error {
 
 // Load restores the database from a JSON file previously created by Save.
 func (db *DB) Load(path string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
