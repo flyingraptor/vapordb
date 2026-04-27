@@ -31,9 +31,9 @@ func readLogEntries(t *testing.T, path string) []map[string]any {
 func TestQueryLog_NoLogBeforeSave(t *testing.T) {
 	db := New()
 	mustExec(t, db, `INSERT INTO t (v) VALUES (1)`)
-	// No Save called — logPath is empty, nothing written to disk.
-	if db.logPath != "" {
-		t.Fatalf("expected empty logPath before Save, got %q", db.logPath)
+	// No Save called — logPath is nil, nothing written to disk.
+	if db.logPath.Load() != nil {
+		t.Fatalf("expected nil logPath before Save")
 	}
 }
 
@@ -46,8 +46,9 @@ func TestQueryLog_LogPathDerivedFromSavePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	expected := dir + "/db_queries.jsonl"
-	if db.logPath != expected {
-		t.Fatalf("expected log path %q, got %q", expected, db.logPath)
+	p := db.logPath.Load()
+	if p == nil || *p != expected {
+		t.Fatalf("expected log path %q, got %v", expected, p)
 	}
 }
 

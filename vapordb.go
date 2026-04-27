@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xwb1989/sqlparser"
@@ -18,7 +19,7 @@ import (
 type DB struct {
 	mu      sync.RWMutex
 	Tables  map[string]*Table
-	logPath string // set by Save/Load; empty means no query logging
+	logPath atomic.Pointer[string] // set by Save/Load; nil means no query logging
 }
 
 // New creates an empty database.
@@ -118,7 +119,10 @@ func (db *DB) Query(sql string) (rows []Row, retErr error) {
 	} else {
 		db.mu.RLock()
 	}
-	logPath := db.logPath
+	logPath := ""
+	if p := db.logPath.Load(); p != nil {
+		logPath = *p
+	}
 	defer func() {
 		if hasDML {
 			db.mu.Unlock()
@@ -175,7 +179,10 @@ func execSelectStatement(db *DB, stmt sqlparser.Statement) ([]Row, error) {
 func (db *DB) Exec(sql string) (retErr error) {
 	start := time.Now()
 	db.mu.Lock()
-	logPath := db.logPath
+	logPath := ""
+	if p := db.logPath.Load(); p != nil {
+		logPath = *p
+	}
 	defer func() {
 		db.mu.Unlock()
 		appendQueryLog(logPath, "exec", sql, 0, time.Since(start), retErr)
@@ -231,7 +238,8 @@ func (db *DB) Save(path string) error {
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
-	db.logPath = logPathFor(path)
+	lp := logPathFor(path)
+	db.logPath.Store(&lp)
 	return nil
 }
 
@@ -253,6 +261,7 @@ func (db *DB) Load(path string) error {
 	if db.Tables == nil {
 		db.Tables = make(map[string]*Table)
 	}
-	db.logPath = logPathFor(path)
+	lp := logPathFor(path)
+	db.logPath.Store(&lp)
 	return nil
 }
