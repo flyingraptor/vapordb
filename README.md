@@ -741,7 +741,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Roadmap
 
-- **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`.
+- **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`. Note: full JSON query languages such as PostgreSQL's `jsonpath` (`@@`, `@?`) or MySQL's `JSON_TABLE` are out of scope — only the basic operators listed above will be supported.
 
 - **`ENUM` type support.** Recognise `ENUM(...)` column definitions in both MySQL and PostgreSQL syntax and store the allowed values alongside the column schema. Inserts or updates that provide a value not in the declared set return an error. The enum set widens automatically (new variants are added) but never narrows on its own; narrowing requires an explicit schema change.
 
