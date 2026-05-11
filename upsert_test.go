@@ -176,3 +176,56 @@ func TestUpsertConstantInUpdate(t *testing.T) {
 		t.Errorf("constant update: want 'active', got %v", rows[0]["status"])
 	}
 }
+
+// ── RETURNING on upsert ──────────────────────────────────────────────────────
+
+func TestUpsertReturningOnConflictUpdate(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO t (id, name) VALUES (1, 'a')`)
+	rows, err := db.Query(`
+		INSERT INTO t (id, name) VALUES (1, 'b')
+		ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+		RETURNING id, name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0]["id"] != intVal(1) || rows[0]["name"] != strVal("b") {
+		t.Fatalf("want one row id=1 name=b, got %v", rows)
+	}
+}
+
+func TestUpsertReturningOnConflictDoNothing(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO t (id, name) VALUES (1, 'a')`)
+	rows, err := db.Query(`
+		INSERT INTO t (id, name) VALUES (1, 'b')
+		ON CONFLICT (id) DO NOTHING
+		RETURNING id, name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("DO NOTHING: want no RETURNING rows, got %d %v", len(rows), rows)
+	}
+}
+
+func TestUpsertReturningMixedValuesOrder(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO t (id, v) VALUES (1, 1)`)
+	rows, err := db.Query(`
+		INSERT INTO t (id, v) VALUES (2, 2), (1, 99)
+		ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+		RETURNING id, v`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("want 2 rows, got %v", rows)
+	}
+	if rows[0]["id"] != intVal(2) || rows[0]["v"] != intVal(2) {
+		t.Fatalf("row0: want id=2 v=2, got %v", rows[0])
+	}
+	if rows[1]["id"] != intVal(1) || rows[1]["v"] != intVal(99) {
+		t.Fatalf("row1: want id=1 v=99, got %v", rows[1])
+	}
+}

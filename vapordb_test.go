@@ -86,22 +86,92 @@ func TestSafeWideningIntToFloat(t *testing.T) {
 	}
 }
 
-// ─── unsafe conflict (wipe) ───────────────────────────────────────────────────
+// ─── schema type conflict (reject by default) ────────────────────────────────
 
-func TestUnsafeConflictWipes(t *testing.T) {
+func TestSchemaConflictRejectedByDefault(t *testing.T) {
 	db := New()
 	mustExec(t, db, `INSERT INTO t (x) VALUES (1)`)
 	mustExec(t, db, `INSERT INTO t (x) VALUES (2)`)
 	if len(db.Tables["t"].Rows) != 2 {
 		t.Fatal("expected 2 rows before conflict")
 	}
-	// Inserting a string into an int column crosses numeric↔string boundary → conflict → wipe.
+	err := db.Exec(`INSERT INTO t (x) VALUES ('hello')`)
+	if err == nil {
+		t.Fatal("expected error on incompatible type without force option")
+	}
+	if len(db.Tables["t"].Rows) != 2 {
+		t.Fatalf("expected 2 rows preserved, got %d", len(db.Tables["t"].Rows))
+	}
+	if db.Tables["t"].Schema["x"] != KindInt {
+		t.Fatalf("expected schema unchanged KindInt, got %v", db.Tables["t"].Schema["x"])
+	}
+}
+
+func TestSchemaConflictForceWipeRestoresLegacyBehaviour(t *testing.T) {
+	db := New(WithForceWipeOnSchemaConflict(true))
+	mustExec(t, db, `INSERT INTO t (x) VALUES (1)`)
+	mustExec(t, db, `INSERT INTO t (x) VALUES (2)`)
+	if len(db.Tables["t"].Rows) != 2 {
+		t.Fatal("expected 2 rows before conflict")
+	}
 	mustExec(t, db, `INSERT INTO t (x) VALUES ('hello')`)
 	if len(db.Tables["t"].Rows) != 1 {
-		t.Fatalf("expected 1 row after wipe, got %d: %v", len(db.Tables["t"].Rows), db.Tables["t"].Rows)
+		t.Fatalf("expected 1 row after forced wipe, got %d: %v", len(db.Tables["t"].Rows), db.Tables["t"].Rows)
 	}
 	if db.Tables["t"].Schema["x"] != KindString {
 		t.Errorf("expected KindString schema after conflict, got %v", db.Tables["t"].Schema["x"])
+	}
+}
+
+func TestWriteForceWipeOnSchemaConflictPerExec(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO t (x) VALUES (1)`)
+	mustExec(t, db, `INSERT INTO t (x) VALUES (2)`)
+	err := db.Exec(`INSERT INTO t (x) VALUES ('hello')`)
+	if err == nil {
+		t.Fatal("default exec should reject conflict")
+	}
+	if err := db.Exec(`INSERT INTO t (x) VALUES ('hello')`, WithWriteForceWipeOnSchemaConflict(true)); err != nil {
+		t.Fatalf("per-exec force insert: %v", err)
+	}
+	if len(db.Tables["t"].Rows) != 1 || db.Tables["t"].Schema["x"] != KindString {
+		t.Fatalf("per-exec force: want 1 row KindString, got rows=%d schema=%v",
+			len(db.Tables["t"].Rows), db.Tables["t"].Schema["x"])
+	}
+}
+
+func TestWriteForceRejectOverridesDBDefaultWipe(t *testing.T) {
+	db := New(WithForceWipeOnSchemaConflict(true))
+	mustExec(t, db, `INSERT INTO t (x) VALUES (1)`)
+	mustExec(t, db, `INSERT INTO t (x) VALUES (2)`)
+	err := db.Exec(`INSERT INTO t (x) VALUES ('hello')`, WithWriteForceWipeOnSchemaConflict(false))
+	if err == nil {
+		t.Fatal("expected per-exec false to reject despite DB default wipe")
+	}
+	if len(db.Tables["t"].Rows) != 2 || db.Tables["t"].Schema["x"] != KindInt {
+		t.Fatalf("rows and schema should be unchanged, got rows=%d schema=%v",
+			len(db.Tables["t"].Rows), db.Tables["t"].Schema["x"])
+	}
+}
+
+func TestWriteForceWipeQueryReturning(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO t (x) VALUES (1)`)
+	mustExec(t, db, `INSERT INTO t (x) VALUES (2)`)
+	_, err := db.Query(`INSERT INTO t (x) VALUES ('z') RETURNING x`)
+	if err == nil {
+		t.Fatal("expected error without force")
+	}
+	rows, err := db.Query(`INSERT INTO t (x) VALUES ('z') RETURNING x`, WithWriteForceWipeOnSchemaConflict(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0]["x"] != strVal("z") {
+		t.Fatalf("want one returned row z, got %v", rows)
+	}
+	if db.Tables["t"].Schema["x"] != KindString || len(db.Tables["t"].Rows) != 1 {
+		t.Fatalf("after wipe+insert want 1 row KindString, got %d rows schema=%v",
+			len(db.Tables["t"].Rows), db.Tables["t"].Schema["x"])
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,17 +15,90 @@ import (
 	"github.com/xwb1989/sqlparser"
 )
 
+// fullOuterRE matches FULL [OUTER] JOIN (case-insensitive) at word boundaries.
+var fullOuterRE = regexp.MustCompile(`(?i)\bFULL\s+(?:OUTER\s+)?JOIN\b`)
+
+// rewriteFullOuterJoins replaces FULL [OUTER] JOIN with STRAIGHT_JOIN so the
+// MySQL-dialect parser (which has no FULL OUTER JOIN production) accepts the
+// statement. walkTableExpr maps "straight_join" back to "full join" after
+// parsing so that applyJoin can apply the correct FULL OUTER semantics.
+func rewriteFullOuterJoins(sql string) string {
+	return fullOuterRE.ReplaceAllString(sql, "STRAIGHT_JOIN")
+}
+
 // DB is the top-level in-memory database.
 // All public methods are safe for concurrent use by multiple goroutines.
 type DB struct {
 	mu      sync.RWMutex
 	Tables  map[string]*Table
 	logPath atomic.Pointer[string] // set by Save/Load; nil means no query logging
+
+	// forceWipeOnSchemaConflict selects legacy behaviour when an INSERT would
+	// introduce an incompatible column type: wipe all rows and adopt the new
+	// type. By default (false) such inserts return an error instead.
+	forceWipeOnSchemaConflict bool
 }
 
-// New creates an empty database.
-func New() *DB {
-	return &DB{Tables: make(map[string]*Table)}
+// Option configures a [DB] created with [New].
+type Option func(*DB)
+
+// WithForceWipeOnSchemaConflict enables (true) or disables (false) the legacy
+// schema-conflict behaviour: incompatible types on an existing column clear
+// the table and adopt the incoming type. When false (the default), those
+// inserts return an error so mistakes are visible. Schema-locked tables always
+// reject conflicts regardless of this setting.
+//
+// This sets the default for the lifetime of the [DB]; override per call with
+// [WithWriteForceWipeOnSchemaConflict].
+func WithForceWipeOnSchemaConflict(v bool) Option {
+	return func(db *DB) {
+		db.forceWipeOnSchemaConflict = v
+	}
+}
+
+// New creates an empty database. Pass zero or more [Option] values to tune
+// behaviour (for example [WithForceWipeOnSchemaConflict]).
+func New(opts ...Option) *DB {
+	db := &DB{Tables: make(map[string]*Table)}
+	for _, o := range opts {
+		if o != nil {
+			o(db)
+		}
+	}
+	return db
+}
+
+// writeOpts holds per-call overrides for mutating operations.
+type writeOpts struct {
+	forceWipe *bool
+}
+
+// WriteOption configures a single [DB.Exec], [DB.ExecNamed], [DB.Query] (for
+// DML with RETURNING), or [DB.QueryNamed] when the expanded statement mutates
+// data.
+type WriteOption func(*writeOpts)
+
+// WithWriteForceWipeOnSchemaConflict overrides the database default from [New]
+// and [WithForceWipeOnSchemaConflict] for this call only. True enables the
+// legacy wipe-on-incompatible-type behaviour for inserts in this execution;
+// false forces rejection even when the DB default would wipe.
+func WithWriteForceWipeOnSchemaConflict(v bool) WriteOption {
+	return func(o *writeOpts) {
+		o.forceWipe = &v
+	}
+}
+
+func effectiveForceWipeOnSchemaConflict(db *DB, opts []WriteOption) bool {
+	var o writeOpts
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	if o.forceWipe != nil {
+		return *o.forceWipe
+	}
+	return db.forceWipeOnSchemaConflict
 }
 
 // LockSchema freezes the schema of every table that currently exists in the
@@ -108,7 +182,11 @@ func (db *DB) DeclareEnum(table, column string, values ...string) {
 //	db.Query(`INSERT INTO t (id, name) VALUES (1, 'alice') RETURNING *`)
 //	db.Query(`UPDATE t SET name = 'bob' WHERE id = 1 RETURNING id, name`)
 //	db.Query(`DELETE FROM t WHERE id = 1 RETURNING id`)
-func (db *DB) Query(sql string) (rows []Row, retErr error) {
+//
+// Optional [WriteOption] values apply when the statement is DML (for example
+// [WithWriteForceWipeOnSchemaConflict] on INSERT … RETURNING); they are ignored
+// for plain SELECTs.
+func (db *DB) Query(sql string, opts ...WriteOption) (rows []Row, retErr error) {
 	start := time.Now()
 	// Choose locking strategy before acquiring any lock: DML+RETURNING mutates
 	// the database and requires an exclusive write lock; pure SELECTs only need
@@ -132,16 +210,18 @@ func (db *DB) Query(sql string) (rows []Row, retErr error) {
 		appendQueryLog(logPath, "query", sql, len(rows), time.Since(start), retErr)
 	}()
 
-	target, mainSQL, err := resolveCTEs(db, sql)
+	forceWipe := effectiveForceWipeOnSchemaConflict(db, opts)
+	target, mainSQL, err := resolveCTEs(db, sql, forceWipe)
 	if err != nil {
 		return nil, err
 	}
 
 	// DML with RETURNING is handled before SELECT-only processing.
 	if dmlSQL, retCols, hasReturning := extractReturning(mainSQL); hasReturning {
-		return execDMLReturning(target, dmlSQL, retCols)
+		return execDMLReturning(target, dmlSQL, retCols, forceWipe)
 	}
 
+	mainSQL = rewriteFullOuterJoins(mainSQL)
 	mainSQL, winSpecs, err := extractWindowFuncs(mainSQL)
 	if err != nil {
 		return nil, err
@@ -149,6 +229,12 @@ func (db *DB) Query(sql string) (rows []Row, retErr error) {
 	stmt, err := sqlparser.Parse(rewriteAnyAll(mainSQL))
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
+	}
+	// Window functions must see the full row set before LIMIT/OFFSET; execSelect
+	// applies LIMIT internally, so defer the outer limit until after applyWindowFuncs.
+	var deferredLimit *sqlparser.Limit
+	if len(winSpecs) > 0 {
+		deferredLimit = detachOuterLimit(stmt)
 	}
 	rows, err = execSelectStatement(target, stmt)
 	if err != nil {
@@ -160,7 +246,31 @@ func (db *DB) Query(sql string) (rows []Row, retErr error) {
 			return nil, err
 		}
 	}
+	if deferredLimit != nil {
+		rows, err = applyLimit(db, rows, deferredLimit)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return rows, nil
+}
+
+// detachOuterLimit removes LIMIT/OFFSET from the outermost SELECT or UNION.
+// Used with window queries so the executor runs on all rows; callers re-apply
+// via applyLimit afterwards.
+func detachOuterLimit(stmt sqlparser.Statement) *sqlparser.Limit {
+	switch s := stmt.(type) {
+	case *sqlparser.Select:
+		lim := s.Limit
+		s.Limit = nil
+		return lim
+	case *sqlparser.Union:
+		lim := s.Limit
+		s.Limit = nil
+		return lim
+	default:
+		return nil
+	}
 }
 
 // execSelectStatement dispatches a parsed statement to execSelect or execUnion.
@@ -176,7 +286,9 @@ func execSelectStatement(db *DB, stmt sqlparser.Statement) ([]Row, error) {
 }
 
 // Exec executes an INSERT, UPDATE, DELETE, or WITH … SELECT statement.
-func (db *DB) Exec(sql string) (retErr error) {
+// Optional [WriteOption] values apply when the statement is an INSERT that may
+// trigger schema inference (for example [WithWriteForceWipeOnSchemaConflict]).
+func (db *DB) Exec(sql string, opts ...WriteOption) (retErr error) {
 	start := time.Now()
 	db.mu.Lock()
 	logPath := ""
@@ -188,7 +300,8 @@ func (db *DB) Exec(sql string) (retErr error) {
 		appendQueryLog(logPath, "exec", sql, 0, time.Since(start), retErr)
 	}()
 
-	target, mainSQL, err := resolveCTEs(db, sql)
+	forceWipe := effectiveForceWipeOnSchemaConflict(db, opts)
+	target, mainSQL, err := resolveCTEs(db, sql, forceWipe)
 	if err != nil {
 		return err
 	}
@@ -201,7 +314,7 @@ func (db *DB) Exec(sql string) (retErr error) {
 	}
 	switch s := stmt.(type) {
 	case *sqlparser.Insert:
-		return execInsert(db, s, conflictCols, doNothing)
+		return execInsert(db, s, conflictCols, doNothing, forceWipe, nil, nil)
 	case *sqlparser.Update:
 		return execUpdate(db, s)
 	case *sqlparser.Delete:

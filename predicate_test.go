@@ -304,6 +304,74 @@ func TestNotLike(t *testing.T) {
 	}
 }
 
+func TestLikeMatchEscapeUnit(t *testing.T) {
+	if !LikeMatchEscape(`50#%`, `50%`, '#') {
+		t.Fatal("50 hash-percent should match fifty percent")
+	}
+	if LikeMatchEscape(`50#%`, `50x`, '#') {
+		t.Fatal("50 hash-percent should not match 50x")
+	}
+	if !LikeMatchEscape(`a#%`, `a%`, '#') {
+		t.Fatal("a hash-percent should match a percent only")
+	}
+	if LikeMatchEscape(`a#%`, `a%b`, '#') {
+		t.Fatal("a hash-percent should not match a percent b")
+	}
+	if !LikeMatchEscape(`a#_b`, `a_b`, '#') {
+		t.Fatal("literal underscore via #_")
+	}
+	if LikeMatchEscape(`50#`, `50`, '#') {
+		t.Fatal("trailing lone escape should not match")
+	}
+}
+
+func TestLikeEscapeLiteralPercent(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('50%')`)
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('50x')`)
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('150%')`)
+	rows := mustQuery(t, db, `SELECT p FROM paths WHERE p LIKE '50#%' ESCAPE '#' ORDER BY p`)
+	if len(rows) != 1 || rows[0]["p"] != strVal("50%") {
+		t.Fatalf("want one row p=50 percent, got %v", rows)
+	}
+}
+
+func TestLikeEscapeLiteralUnderscore(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('x_y')`)
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('xy')`)
+	rows := mustQuery(t, db, `SELECT p FROM paths WHERE p LIKE 'x|_y' ESCAPE '|'`)
+	if len(rows) != 1 || rows[0]["p"] != strVal("x_y") {
+		t.Fatalf("want x_y, got %v", rows)
+	}
+}
+
+func TestNotLikeEscape(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('a%b')`)
+	mustExec(t, db, `INSERT INTO paths (p) VALUES ('acb')`)
+	rows := mustQuery(t, db, `SELECT p FROM paths WHERE p NOT LIKE 'a#%b' ESCAPE '#' ORDER BY p`)
+	if len(rows) != 1 || rows[0]["p"] != strVal("acb") {
+		t.Fatalf("want acb only, got %v", rows)
+	}
+}
+
+func TestLikeEscapeEmptyDisables(t *testing.T) {
+	db := New()
+	_, err := db.Query(`SELECT 1 AS n FROM DUAL WHERE 'hello' LIKE 'h_llo' ESCAPE ''`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLikeEscapeInvalidLength(t *testing.T) {
+	db := New()
+	_, err := db.Query(`SELECT 1 AS n FROM DUAL WHERE 'a' LIKE 'a' ESCAPE '##'`)
+	if err == nil {
+		t.Fatal("expected error for multi-rune ESCAPE")
+	}
+}
+
 // ─── AND / OR / NOT ───────────────────────────────────────────────────────────
 
 func TestAnd(t *testing.T) {

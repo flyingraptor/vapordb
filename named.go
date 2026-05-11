@@ -1,14 +1,19 @@
 package vapordb
 
 import (
+	"encoding"
 	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
+
+var textMarshalerType = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
 
 // QueryNamed executes a SELECT statement with named :param placeholders.
 // params may be a map[string]any or a struct with `db` field tags.
+// Optional [WriteOption] values are forwarded to [DB.Query] (for DML with RETURNING).
 //
 // Example:
 //
@@ -16,16 +21,17 @@ import (
 //	    `SELECT * FROM orders WHERE user_id = :uid AND status = :status`,
 //	    map[string]any{"uid": 42, "status": "open"},
 //	)
-func (db *DB) QueryNamed(sql string, params any) ([]Row, error) {
+func (db *DB) QueryNamed(sql string, params any, opts ...WriteOption) ([]Row, error) {
 	expanded, err := expandNamed(sql, params)
 	if err != nil {
 		return nil, err
 	}
-	return db.Query(expanded)
+	return db.Query(expanded, opts...)
 }
 
 // ExecNamed executes an INSERT, UPDATE, or DELETE with named :param placeholders.
 // params may be a map[string]any or a struct with `db` field tags.
+// Optional [WriteOption] values are forwarded to [DB.Exec].
 //
 // Example:
 //
@@ -33,12 +39,12 @@ func (db *DB) QueryNamed(sql string, params any) ([]Row, error) {
 //	    `INSERT INTO users (id, name) VALUES (:id, :name)`,
 //	    User{ID: 1, Name: "Alice"},
 //	)
-func (db *DB) ExecNamed(sql string, params any) error {
+func (db *DB) ExecNamed(sql string, params any, opts ...WriteOption) error {
 	expanded, err := expandNamed(sql, params)
 	if err != nil {
 		return err
 	}
-	return db.Exec(expanded)
+	return db.Exec(expanded, opts...)
 }
 
 // expandNamed replaces every :param placeholder in sql with its SQL literal
@@ -121,15 +127,44 @@ func toParamMap(params any) (map[string]any, error) {
 	}
 
 	rt := rv.Type()
-	m := make(map[string]any, rt.NumField())
+	m := make(map[string]any, rt.NumField()*2)
+	appendStructFieldsToParamMap(rv, rt, m)
+	return m, nil
+}
+
+// appendStructFieldsToParamMap adds `db`-tagged values from rv/rt into m,
+// recursing into embedded anonymous struct or *struct fields.
+func appendStructFieldsToParamMap(rv reflect.Value, rt reflect.Type, m map[string]any) {
 	for i := 0; i < rt.NumField(); i++ {
-		tag := rt.Field(i).Tag.Get("db")
+		sf := rt.Field(i)
+		fv := rv.Field(i)
+
+		if sf.Anonymous {
+			switch sf.Type.Kind() {
+			case reflect.Struct:
+				appendStructFieldsToParamMap(fv, sf.Type, m)
+				continue
+			case reflect.Pointer:
+				if sf.Type.Elem().Kind() == reflect.Struct {
+					if fv.IsNil() {
+						continue
+					}
+					appendStructFieldsToParamMap(fv.Elem(), sf.Type.Elem(), m)
+					continue
+				}
+			}
+		}
+
+		if !sf.IsExported() {
+			continue
+		}
+
+		tag := sf.Tag.Get("db")
 		if tag == "" || tag == "-" {
 			continue
 		}
-		m[tag] = rv.Field(i).Interface()
+		m[tag] = fv.Interface()
 	}
-	return m, nil
 }
 
 // anyToSQLLiteral converts a Go value to its SQL literal representation.
@@ -147,6 +182,48 @@ func anyToSQLLiteral(v any) (string, error) {
 		}
 		rv = rv.Elem()
 	}
+
+	// time.Time, driver.Valuer, TextMarshaler, fmt.Stringer — aligned with
+	// [structFieldToSQL]. Must run before the slice branch so net.IP ([]byte
+	// with Stringer) becomes a quoted address, not a list of byte literals.
+	if rv.Type() == timeType {
+		t := rv.Interface().(time.Time)
+		if t.IsZero() {
+			return "NULL", nil
+		}
+		return fmt.Sprintf("DATE('%s')", t.UTC().Format("2006-01-02 15:04:05")), nil
+	}
+	if dv, ok := valuerOf(rv); ok {
+		dbVal, err := dv.Value()
+		if err != nil {
+			return "", fmt.Errorf("driver.Valuer: %w", err)
+		}
+		if dbVal == nil {
+			return "NULL", nil
+		}
+		return driverValueToSQL(dbVal), nil
+	}
+	if rv.Type().Implements(textMarshalerType) {
+		b, err := rv.Interface().(encoding.TextMarshaler).MarshalText()
+		if err != nil {
+			return "", fmt.Errorf("MarshalText: %w", err)
+		}
+		return quotedString(string(b)), nil
+	}
+	if rv.CanAddr() && rv.Addr().Type().Implements(textMarshalerType) {
+		b, err := rv.Addr().Interface().(encoding.TextMarshaler).MarshalText()
+		if err != nil {
+			return "", fmt.Errorf("MarshalText: %w", err)
+		}
+		return quotedString(string(b)), nil
+	}
+	if rv.Type().Implements(stringerType) {
+		return quotedString(rv.Interface().(fmt.Stringer).String()), nil
+	}
+	if rv.CanAddr() && rv.Addr().Type().Implements(stringerType) {
+		return quotedString(rv.Addr().Interface().(fmt.Stringer).String()), nil
+	}
+
 	// Slices → comma-separated literals (used inside IN (…)).
 	if rv.Kind() == reflect.Slice {
 		if rv.Len() == 0 {

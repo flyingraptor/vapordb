@@ -117,7 +117,9 @@ func Widen(a, b Kind) Kind {
 }
 
 // IsConflict returns true when the incoming type is incompatible with the
-// existing schema type, triggering an unsafe table wipe.
+// existing schema type. [UpsertSchema] rejects such inserts unless
+// forceWipeOnSchemaConflict is true (see [WithForceWipeOnSchemaConflict],
+// [WithWriteForceWipeOnSchemaConflict]).
 //
 // Rules (per spec):
 //   - NULL never conflicts.
@@ -257,6 +259,58 @@ func valueString(v Value) string {
 // % matches any sequence of characters; _ matches any single character.
 func LikeMatch(pattern, value string) bool {
 	return likeMatch([]rune(pattern), []rune(value))
+}
+
+// LikeMatchEscape is LIKE with an SQL ESCAPE character (non-empty esc).
+// A two-rune sequence esc+x matches the literal character x (including % and _).
+// An invalid pattern ending with esc alone never matches.
+func LikeMatchEscape(pattern, value string, esc rune) bool {
+	return likeMatchEsc([]rune(pattern), []rune(value), esc)
+}
+
+func likeMatchEsc(pattern, s []rune, esc rune) bool {
+	for len(pattern) > 0 {
+		if pattern[0] == esc {
+			if len(pattern) < 2 {
+				return false
+			}
+			lit := pattern[1]
+			if len(s) == 0 || s[0] != lit {
+				return false
+			}
+			pattern = pattern[2:]
+			s = s[1:]
+			continue
+		}
+		switch pattern[0] {
+		case '%':
+			for len(pattern) > 0 && pattern[0] == '%' {
+				pattern = pattern[1:]
+			}
+			if len(pattern) == 0 {
+				return true
+			}
+			for i := 0; i <= len(s); i++ {
+				if likeMatchEsc(pattern, s[i:], esc) {
+					return true
+				}
+			}
+			return false
+		case '_':
+			if len(s) == 0 {
+				return false
+			}
+			pattern = pattern[1:]
+			s = s[1:]
+		default:
+			if len(s) == 0 || pattern[0] != s[0] {
+				return false
+			}
+			pattern = pattern[1:]
+			s = s[1:]
+		}
+	}
+	return len(s) == 0
 }
 
 func likeMatch(pattern, s []rune) bool {

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/xwb1989/sqlparser"
 )
@@ -14,9 +15,10 @@ import (
 // ─── TABLE REFERENCE HELPERS ─────────────────────────────────────────────────
 
 type tableRef struct {
-	name    string // actual table name (or alias for derived tables)
-	alias   string // alias used to qualify column names in the row
-	subRows []Row  // non-nil for derived tables (subquery in FROM)
+	name          string // actual table name (or alias for derived tables)
+	alias         string // alias used to qualify column names in the row
+	subRows       []Row  // non-nil for derived tables (subquery in FROM)
+	explicitAlias bool   // true when AS … was used; qualify keys so alias.col resolves in correlated subqueries
 }
 
 type joinDesc struct {
@@ -54,10 +56,12 @@ func extractTableRef(db *DB, ate *sqlparser.AliasedTableExpr) (tableRef, error) 
 	case sqlparser.TableName:
 		name := expr.Name.String()
 		alias := name
+		explicit := false
 		if !ate.As.IsEmpty() {
 			alias = ate.As.String()
+			explicit = true
 		}
-		return tableRef{name: name, alias: alias}, nil
+		return tableRef{name: name, alias: alias, explicitAlias: explicit}, nil
 
 	case *sqlparser.Subquery:
 		// Derived table: execute the inner SELECT now so its result rows can
@@ -74,7 +78,7 @@ func extractTableRef(db *DB, ate *sqlparser.AliasedTableExpr) (tableRef, error) 
 		if err != nil {
 			return tableRef{}, fmt.Errorf("derived table %q: %w", alias, err)
 		}
-		return tableRef{name: alias, alias: alias, subRows: rows}, nil
+		return tableRef{name: alias, alias: alias, subRows: rows, explicitAlias: true}, nil
 
 	default:
 		return tableRef{}, fmt.Errorf("unsupported FROM expression type: %T", ate.Expr)
@@ -104,9 +108,16 @@ func walkTableExpr(db *DB, te sqlparser.TableExpr) ([]tableRef, []joinDesc, erro
 		if len(rightRefs) == 0 {
 			return leftRefs, leftJoins, nil
 		}
+		jt := strings.ToLower(t.Join)
+		if jt == "straight_join" {
+			// STRAIGHT_JOIN is our sentinel for FULL OUTER JOIN (rewritten by
+			// rewriteFullOuterJoins before parsing because the MySQL-dialect
+			// parser has no FULL OUTER JOIN production).
+			jt = "full join"
+		}
 		jd := joinDesc{
 			right:     rightRefs[0],
-			joinType:  strings.ToLower(t.Join),
+			joinType:  jt,
 			condition: t.Condition.On,
 		}
 		allJoins := append(leftJoins, jd)
@@ -233,13 +244,13 @@ func execUnion(db *DB, stmt *sqlparser.Union) ([]Row, error) {
 	}
 	// Top-level ORDER BY.
 	if len(stmt.OrderBy) > 0 {
-		if err := sortRows(rows, stmt.OrderBy); err != nil {
+		if err := sortRows(db, rows, stmt.OrderBy); err != nil {
 			return nil, err
 		}
 	}
 	// Top-level LIMIT.
 	if stmt.Limit != nil {
-		rows, err = applyLimit(rows, stmt.Limit)
+		rows, err = applyLimit(db, rows, stmt.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -290,7 +301,12 @@ func execUnionNode(db *DB, stmt *sqlparser.Union) ([]Row, error) {
 //
 //   - conflictCols non-nil + stmt.OnDup non-nil  →  update existing row on match
 //   - conflictCols non-nil + doNothing true       →  skip insert on conflict
-func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool) error {
+//
+// When affectedRowIdx is non-nil, each inserted or upsert-updated row's table
+// index is appended (in VALUES order), so INSERT … RETURNING can include
+// ON CONFLICT DO UPDATE results. DO NOTHING conflicts append nothing. Skipped
+// when nil (e.g. plain Exec).
+func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool, trackSchemaWipe *bool, affectedRowIdx *[]int) error {
 	tableName := stmt.Table.Name.String()
 
 	values, ok := stmt.Rows.(sqlparser.Values)
@@ -313,7 +329,7 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 		}
 		row := make(Row, len(cols))
 		for i, expr := range valTuple {
-			val, err := evalExpr(expr, Row{})
+			val, err := evalExpr(db, expr, Row{})
 			if err != nil {
 				return fmt.Errorf("evaluating value for column %q: %w", cols[i], err)
 			}
@@ -329,8 +345,12 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 
 		// ── Upsert path ──────────────────────────────────────────────────────
 		if len(conflictCols) > 0 {
-			if err := UpsertSchema(db, tableName, row); err != nil {
+			w, err := UpsertSchema(db, tableName, row, forceWipeOnSchemaConflict)
+			if err != nil {
 				return err
+			}
+			if trackSchemaWipe != nil && w {
+				*trackSchemaWipe = true
 			}
 			tbl := db.Tables[tableName]
 			if idx := findConflict(tbl, conflictCols, row); idx >= 0 {
@@ -339,19 +359,26 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 					continue // skip this row silently
 				}
 				// Apply ON DUPLICATE KEY UPDATE assignments.
-				if err := applyOnDup(tbl.Rows[idx], row, stmt.OnDup); err != nil {
+				if err := applyOnDup(db, tbl.Rows[idx], row, stmt.OnDup); err != nil {
 					return err
 				}
 				// Re-validate after the update assignments.
 				if err := validateEnum(tbl, tbl.Rows[idx]); err != nil {
 					return err
 				}
+				if affectedRowIdx != nil {
+					*affectedRowIdx = append(*affectedRowIdx, idx)
+				}
 				continue
 			}
 		}
 		// ── Normal insert ────────────────────────────────────────────────────
-		if err := UpsertSchema(db, tableName, row); err != nil {
+		w, err := UpsertSchema(db, tableName, row, forceWipeOnSchemaConflict)
+		if err != nil {
 			return err
+		}
+		if trackSchemaWipe != nil && w {
+			*trackSchemaWipe = true
 		}
 		tbl := db.Tables[tableName]
 		for col := range tbl.Schema {
@@ -360,6 +387,9 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 			}
 		}
 		tbl.Rows = append(tbl.Rows, row)
+		if affectedRowIdx != nil {
+			*affectedRowIdx = append(*affectedRowIdx, len(tbl.Rows)-1)
+		}
 	}
 	return nil
 }
@@ -389,7 +419,7 @@ func findConflict(tbl *Table, conflictCols []string, incoming Row) int {
 // parsed INSERT statement. Each assignment is either VALUES(col) — meaning
 // "use the value from the incoming row" — or any other expression evaluated
 // against the incoming row as context.
-func applyOnDup(target Row, incoming Row, onDup sqlparser.OnDup) error {
+func applyOnDup(db *DB, target Row, incoming Row, onDup sqlparser.OnDup) error {
 	for _, upd := range onDup {
 		colName := upd.Name.Name.Lowered()
 		var newVal Value
@@ -405,7 +435,7 @@ func applyOnDup(target Row, incoming Row, onDup sqlparser.OnDup) error {
 		default:
 			// General expression evaluated in the context of the incoming row.
 			var err error
-			newVal, err = evalExpr(expr, incoming)
+			newVal, err = evalExpr(db, expr, incoming)
 			if err != nil {
 				return fmt.Errorf("ON CONFLICT update expr for %q: %w", colName, err)
 			}
@@ -427,6 +457,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 	}
 
 	isMultiTable := len(refs) > 1
+	qualifyFirst := isMultiTable || refs[0].explicitAlias
 
 	// Build initial rows from the first table (real or derived).
 	firstRef := refs[0]
@@ -435,7 +466,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 		// MySQL's implicit dummy table: SELECT expr (no real FROM clause).
 		rows = []Row{{}}
 	} else {
-		rows = rowsForRef(db, firstRef, isMultiTable)
+		rows = rowsForRef(db, firstRef, qualifyFirst)
 	}
 
 	// Apply joins.
@@ -457,7 +488,7 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 	// GROUP BY / aggregates.
 	hasAgg := selectHasAggregates(stmt.SelectExprs)
 	if len(stmt.GroupBy) > 0 || hasAgg {
-		rows, err = applyGroupBy(rows, stmt.GroupBy, stmt.SelectExprs)
+		rows, err = applyGroupBy(db, rows, stmt.GroupBy, stmt.SelectExprs)
 		if err != nil {
 			return nil, err
 		}
@@ -478,14 +509,14 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err = sortRows(rows, stmt.OrderBy); err != nil {
+		if err = sortRows(db, rows, stmt.OrderBy); err != nil {
 			return nil, err
 		}
 	}
 
 	// LIMIT.
 	if stmt.Limit != nil {
-		rows, err = applyLimit(rows, stmt.Limit)
+		rows, err = applyLimit(db, rows, stmt.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -505,18 +536,39 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 	return projected, nil
 }
 
+// nullRowLike returns a row whose keys mirror the first row in rows, with every
+// value set to NULL. Used to generate null-padded left-side rows for RIGHT JOIN
+// and FULL OUTER JOIN when a right row has no matching left partner.
+func nullRowLike(rows []Row) Row {
+	if len(rows) == 0 {
+		return Row{}
+	}
+	result := make(Row, len(rows[0]))
+	for k := range rows[0] {
+		result[k] = Null
+	}
+	return result
+}
+
 func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 	rightRows := rowsForRef(db, jd.right, true)
 
 	isLeft := strings.Contains(jd.joinType, "left")
+	isRight := strings.Contains(jd.joinType, "right")
+	isFull := jd.joinType == "full join"
+
 	var result []Row
+	// rightMatched tracks which right rows participated in at least one match;
+	// used to emit null-padded rows for unmatched right rows in RIGHT / FULL joins.
+	rightMatched := make([]bool, len(rightRows))
 
 	for _, lr := range leftRows {
 		matched := false
-		for _, rr := range rightRows {
+		for ri, rr := range rightRows {
 			merged := mergeRows(lr, rr)
 			if jd.condition == nil {
 				result = append(result, merged)
+				rightMatched[ri] = true
 				matched = true
 			} else {
 				ok, err := evalBoolWithDB(db, jd.condition, merged)
@@ -525,14 +577,27 @@ func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 				}
 				if ok {
 					result = append(result, merged)
+					rightMatched[ri] = true
 					matched = true
 				}
 			}
 		}
-		if isLeft && !matched {
+		// LEFT / FULL: unmatched left row → keep with NULLs for right columns.
+		if (isLeft || isFull) && !matched {
 			result = append(result, mergeRows(lr, nullRowForTable(db, jd.right)))
 		}
 	}
+
+	// RIGHT / FULL: unmatched right rows → keep with NULLs for left columns.
+	if isRight || isFull {
+		nullLeft := nullRowLike(leftRows)
+		for ri, rr := range rightRows {
+			if !rightMatched[ri] {
+				result = append(result, mergeRows(nullLeft, rr))
+			}
+		}
+	}
+
 	return result, nil
 }
 
@@ -550,10 +615,10 @@ func applyWhere(db *DB, rows []Row, where *sqlparser.Where) ([]Row, error) {
 	return result, nil
 }
 
-func applyGroupBy(rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.SelectExprs) ([]Row, error) {
+func applyGroupBy(db *DB, rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.SelectExprs) ([]Row, error) {
 	if len(groupBy) == 0 {
 		// No GROUP BY but aggregates present → treat all rows as one group.
-		out, err := computeGroup(rows, selectExprs)
+		out, err := computeGroup(db, rows, selectExprs)
 		if err != nil {
 			return nil, err
 		}
@@ -563,7 +628,7 @@ func applyGroupBy(rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.S
 	groupMap := make(map[string][]Row)
 	var groupOrder []string
 	for _, row := range rows {
-		key, err := computeGroupKey(row, groupBy)
+		key, err := computeGroupKey(db, row, groupBy)
 		if err != nil {
 			return nil, err
 		}
@@ -575,7 +640,7 @@ func applyGroupBy(rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.S
 
 	result := make([]Row, 0, len(groupOrder))
 	for _, key := range groupOrder {
-		out, err := computeGroup(groupMap[key], selectExprs)
+		out, err := computeGroup(db, groupMap[key], selectExprs)
 		if err != nil {
 			return nil, err
 		}
@@ -584,10 +649,10 @@ func applyGroupBy(rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.S
 	return result, nil
 }
 
-func computeGroupKey(row Row, groupBy sqlparser.GroupBy) (string, error) {
+func computeGroupKey(db *DB, row Row, groupBy sqlparser.GroupBy) (string, error) {
 	parts := make([]string, 0, len(groupBy))
 	for _, expr := range groupBy {
-		val, err := evalExpr(expr, row)
+		val, err := evalExpr(db, expr, row)
 		if err != nil {
 			return "", err
 		}
@@ -596,7 +661,7 @@ func computeGroupKey(row Row, groupBy sqlparser.GroupBy) (string, error) {
 	return strings.Join(parts, "\x01"), nil
 }
 
-func computeGroup(rows []Row, selectExprs sqlparser.SelectExprs) (Row, error) {
+func computeGroup(db *DB, rows []Row, selectExprs sqlparser.SelectExprs) (Row, error) {
 	firstRow := Row{}
 	if len(rows) > 0 {
 		firstRow = rows[0]
@@ -613,9 +678,9 @@ func computeGroup(rows []Row, selectExprs sqlparser.SelectExprs) (Row, error) {
 			var val Value
 			var err error
 			if fe, ok := s.Expr.(*sqlparser.FuncExpr); ok && isAggFunc(fe.Name.Lowered()) {
-				val, err = evalAggFunc(fe, rows)
+				val, err = evalAggFunc(db, fe, rows)
 			} else {
-				val, err = evalExpr(s.Expr, firstRow)
+				val, err = evalExpr(db, s.Expr, firstRow)
 			}
 			if err != nil {
 				return nil, err
@@ -631,23 +696,23 @@ func computeGroup(rows []Row, selectExprs sqlparser.SelectExprs) (Row, error) {
 	return out, nil
 }
 
-func evalAggFunc(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+func evalAggFunc(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	switch fe.Name.Lowered() {
 	case "count":
-		return aggCount(fe, rows)
+		return aggCount(db, fe, rows)
 	case "sum":
-		return aggSum(fe, rows)
+		return aggSum(db, fe, rows)
 	case "avg":
-		return aggAvg(fe, rows)
+		return aggAvg(db, fe, rows)
 	case "min":
-		return aggMin(fe, rows)
+		return aggMin(db, fe, rows)
 	case "max":
-		return aggMax(fe, rows)
+		return aggMax(db, fe, rows)
 	}
 	return Null, fmt.Errorf("unknown aggregate function: %s", fe.Name.Lowered())
 }
 
-func aggCount(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+func aggCount(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	if aggIsStar(fe) {
 		return Value{Kind: KindInt, V: int64(len(rows))}, nil
 	}
@@ -658,7 +723,7 @@ func aggCount(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	if fe.Distinct {
 		seen := make(map[string]bool)
 		for _, row := range rows {
-			v, err := evalExpr(argExpr, row)
+			v, err := evalExpr(db, argExpr, row)
 			if err != nil {
 				return Null, err
 			}
@@ -672,7 +737,7 @@ func aggCount(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	}
 	count := int64(0)
 	for _, row := range rows {
-		v, err := evalExpr(argExpr, row)
+		v, err := evalExpr(db, argExpr, row)
 		if err != nil {
 			return Null, err
 		}
@@ -683,7 +748,7 @@ func aggCount(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	return Value{Kind: KindInt, V: count}, nil
 }
 
-func aggSum(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+func aggSum(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	argExpr, err := aggArgExpr(fe)
 	if err != nil {
 		return Null, err
@@ -692,7 +757,7 @@ func aggSum(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	allInt := true
 	any := false
 	for _, row := range rows {
-		v, err := evalExpr(argExpr, row)
+		v, err := evalExpr(db, argExpr, row)
 		if err != nil {
 			return Null, err
 		}
@@ -714,14 +779,14 @@ func aggSum(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	return Value{Kind: KindFloat, V: sum}, nil
 }
 
-func aggAvg(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+func aggAvg(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	argExpr, err := aggArgExpr(fe)
 	if err != nil {
 		return Null, err
 	}
 	sum, count := float64(0), 0
 	for _, row := range rows {
-		v, err := evalExpr(argExpr, row)
+		v, err := evalExpr(db, argExpr, row)
 		if err != nil {
 			return Null, err
 		}
@@ -737,14 +802,14 @@ func aggAvg(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	return Value{Kind: KindFloat, V: sum / float64(count)}, nil
 }
 
-func aggMin(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+func aggMin(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	argExpr, err := aggArgExpr(fe)
 	if err != nil {
 		return Null, err
 	}
 	var minVal *Value
 	for _, row := range rows {
-		v, err := evalExpr(argExpr, row)
+		v, err := evalExpr(db, argExpr, row)
 		if err != nil {
 			return Null, err
 		}
@@ -762,14 +827,14 @@ func aggMin(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	return *minVal, nil
 }
 
-func aggMax(fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+func aggMax(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	argExpr, err := aggArgExpr(fe)
 	if err != nil {
 		return Null, err
 	}
 	var maxVal *Value
 	for _, row := range rows {
-		v, err := evalExpr(argExpr, row)
+		v, err := evalExpr(db, argExpr, row)
 		if err != nil {
 			return Null, err
 		}
@@ -839,19 +904,19 @@ func exprContainsAgg(expr sqlparser.Expr) bool {
 	return false
 }
 
-func sortRows(rows []Row, orderBy sqlparser.OrderBy) error {
+func sortRows(db *DB, rows []Row, orderBy sqlparser.OrderBy) error {
 	var sortErr error
 	sort.SliceStable(rows, func(i, j int) bool {
 		if sortErr != nil {
 			return false
 		}
 		for _, order := range orderBy {
-			a, err := evalExpr(order.Expr, rows[i])
+			a, err := evalExpr(db, order.Expr, rows[i])
 			if err != nil {
 				sortErr = err
 				return false
 			}
-			b, err := evalExpr(order.Expr, rows[j])
+			b, err := evalExpr(db, order.Expr, rows[j])
 			if err != nil {
 				sortErr = err
 				return false
@@ -869,10 +934,10 @@ func sortRows(rows []Row, orderBy sqlparser.OrderBy) error {
 	return sortErr
 }
 
-func applyLimit(rows []Row, limit *sqlparser.Limit) ([]Row, error) {
+func applyLimit(db *DB, rows []Row, limit *sqlparser.Limit) ([]Row, error) {
 	offset := 0
 	if limit.Offset != nil {
-		v, err := evalExpr(limit.Offset, Row{})
+		v, err := evalExpr(nil, limit.Offset, Row{})
 		if err != nil {
 			return nil, err
 		}
@@ -882,7 +947,7 @@ func applyLimit(rows []Row, limit *sqlparser.Limit) ([]Row, error) {
 	}
 	rowcount := len(rows)
 	if limit.Rowcount != nil {
-		v, err := evalExpr(limit.Rowcount, Row{})
+		v, err := evalExpr(nil, limit.Rowcount, Row{})
 		if err != nil {
 			return nil, err
 		}
@@ -1032,7 +1097,7 @@ func execUpdate(db *DB, stmt *sqlparser.Update) error {
 		}
 		for _, upd := range stmt.Exprs {
 			col := upd.Name.Name.Lowered()
-			val, err := evalExpr(upd.Expr, row)
+			val, err := evalExpr(db, upd.Expr, row)
 			if err != nil {
 				return fmt.Errorf("evaluating SET %s: %w", col, err)
 			}
@@ -1095,35 +1160,35 @@ func execDelete(db *DB, stmt *sqlparser.Delete) error {
 
 // ─── EXISTS / CORRELATED SUBQUERY ────────────────────────────────────────────
 
-// execSelectCorrelated runs an EXISTS subquery, merging outerRow as a fallback
-// so that correlated column references (e.g. users.id in an inner WHERE) resolve
-// correctly against the outer driving row.
-func execSelectCorrelated(db *DB, ex *sqlparser.ExistsExpr, outerRow Row) ([]Row, error) {
-	inner, ok := ex.Subquery.Select.(*sqlparser.Select)
-	if !ok {
-		return nil, fmt.Errorf("EXISTS: unsupported subquery type %T", ex.Subquery.Select)
-	}
+// correlatedSubqueryFromWhere runs inner FROM / JOIN / WHERE with outerRow
+// merged into the predicate row (inner columns win on key conflicts). Returns
+// surviving inner rows (not projected).
+func correlatedSubqueryFromWhere(db *DB, inner *sqlparser.Select, outerRow Row) ([]Row, error) {
 	refs, joins, err := extractFromClause(db, inner.From)
 	if err != nil {
 		return nil, err
 	}
 	if len(refs) == 0 {
-		return nil, fmt.Errorf("EXISTS subquery: no tables in FROM clause")
+		return nil, fmt.Errorf("subquery: no tables in FROM clause")
 	}
 
-	isMultiTable := len(refs) > 1
-	rows := rowsForRef(db, refs[0], isMultiTable)
+	// Always qualify the first table's columns (e.g. "orders.id") so that
+	// outer-row columns with the same bare name (e.g. "id" from users) are not
+	// shadowed when the two rows are merged for correlated predicate evaluation.
+	// resolveColumn's suffix-search fallback still finds "orders.user_id" when
+	// a predicate uses the bare name "user_id".
+	rows := rowsForRef(db, refs[0], true)
 	for _, jd := range joins {
 		if rows, err = applyJoin(db, rows, jd); err != nil {
 			return nil, err
 		}
 	}
 	if inner.Where != nil {
+		qualifiedOuter := qualifyOuterRow(db, outerRow)
 		filtered := rows[:0]
 		for _, r := range rows {
-			// Merge: inner columns take priority; outer fills in correlation references.
-			merged := mergeRowsOuter(outerRow, r)
-			ok, err := evalBool(inner.Where.Expr, merged)
+			merged := mergeRowsOuter(qualifiedOuter, r)
+			ok, err := evalBoolWithDB(db, inner.Where.Expr, merged)
 			if err != nil {
 				return nil, err
 			}
@@ -1136,10 +1201,44 @@ func execSelectCorrelated(db *DB, ex *sqlparser.ExistsExpr, outerRow Row) ([]Row
 	return rows, nil
 }
 
-// mergeRowsOuter creates a row containing all of inner's columns plus any
-// outer columns not already present. Inner always wins on key conflicts.
+// execSelectCorrelated runs an EXISTS subquery, merging outerRow as a fallback
+// so that correlated column references (e.g. users.id in an inner WHERE) resolve
+// correctly against the outer driving row.
+func execSelectCorrelated(db *DB, ex *sqlparser.ExistsExpr, outerRow Row) ([]Row, error) {
+	inner, ok := ex.Subquery.Select.(*sqlparser.Select)
+	if !ok {
+		return nil, fmt.Errorf("EXISTS: unsupported subquery type %T", ex.Subquery.Select)
+	}
+	return correlatedSubqueryFromWhere(db, inner, outerRow)
+}
+
+// mergeRowsOuter builds a merged row for correlated predicate evaluation.
+//
+// Priority rules (highest to lowest):
+//  1. Inner qualified keys  (e.g. "orders.user_id" — never overwritten)
+//  2. Inner bare keys       (e.g. "user_id" derived from "orders.user_id")
+//  3. Outer qualified keys  (e.g. "users.id"  — added so predicates like
+//                            `users.id = …` resolve to the outer value)
+//  4. Outer bare keys       (e.g. "id" from outer — added last, only when
+//                            no inner bare key with the same name is present)
+//
+// This ensures that unqualified column references in the inner WHERE (e.g.
+// bare `name`) resolve to the inner table, not the outer row, while
+// qualified outer references (e.g. `users.id`) still find the outer value.
 func mergeRowsOuter(outer, inner Row) Row {
-	result := copyRow(inner)
+	result := copyRow(inner) // step 1: all inner keys (qualified)
+
+	// Step 2: bare versions of inner's qualified keys.
+	for k, v := range inner {
+		if dot := strings.IndexByte(k, '.'); dot > 0 {
+			bare := k[dot+1:]
+			if _, exists := result[bare]; !exists {
+				result[bare] = v
+			}
+		}
+	}
+
+	// Steps 3 & 4: outer keys, only where not already present.
 	for k, v := range outer {
 		if _, exists := result[k]; !exists {
 			result[k] = v
@@ -1148,17 +1247,211 @@ func mergeRowsOuter(outer, inner Row) Row {
 	return result
 }
 
-// evalExprWithDB evaluates an expression, routing *sqlparser.ExistsExpr through
-// the correlated subquery engine. All other nodes delegate to evalExpr.
-func evalExprWithDB(db *DB, expr sqlparser.Expr, row Row) (Value, error) {
-	if ex, ok := expr.(*sqlparser.ExistsExpr); ok {
-		rows, err := execSelectCorrelated(db, ex, row)
+// qualifyOuterRow adds qualified copies (tablename.col) of bare keys in row by
+// matching the row's column set against the DB schema. This allows correlated
+// predicates that reference the outer table by name (e.g. `users.id`) to find
+// the correct outer value even when the outer query stored the row with bare
+// keys. Called only when the row has no qualified keys (single-table outer).
+// Access to db.Tables is NOT lock-guarded here because this is always called
+// from within a query that already holds db.mu.RLock.
+func qualifyOuterRow(db *DB, row Row) Row {
+	if len(row) == 0 {
+		return row
+	}
+	// If row already has qualified keys (join / alias outer), return as-is.
+	for k := range row {
+		if strings.Contains(k, ".") {
+			return row
+		}
+	}
+	// Find the table whose schema is the largest subset of the row's bare keys.
+	// Using subset-fit (rather than exact-fit) handles enriched rows where
+	// computed aliases (e.g. ORDER BY enrichment) have added extra columns.
+	tableName := ""
+	bestLen := 0
+	for name, tbl := range db.Tables {
+		if len(tbl.Schema) > len(row) {
+			continue // schema has more columns than the row → can't match
+		}
+		match := true
+		for k := range tbl.Schema {
+			if _, ok := row[k]; !ok {
+				match = false
+				break
+			}
+		}
+		if match && len(tbl.Schema) > bestLen {
+			tableName = name
+			bestLen = len(tbl.Schema)
+		}
+	}
+	if tableName == "" {
+		return row
+	}
+	// Build a copy that has both bare keys and tablename.col keys.
+	out := make(Row, len(row)*2)
+	for k, v := range row {
+		out[k] = v
+		out[tableName+"."+k] = v
+	}
+	return out
+}
+
+// execSelectForIn runs a subquery on the RHS of IN / NOT IN with outerRow merged
+// for correlation, returning one projected row per surviving inner row.
+func execSelectForIn(db *DB, sub *sqlparser.Subquery, outerRow Row) ([]Row, error) {
+	switch sel := sub.Select.(type) {
+	case *sqlparser.Select:
+		return execSelectForInSelect(db, sel, outerRow)
+	case *sqlparser.Union:
+		return nil, fmt.Errorf("IN (subquery): UNION is not supported yet")
+	default:
+		return nil, fmt.Errorf("IN (subquery): unsupported subquery type %T", sub.Select)
+	}
+}
+
+func execSelectForInSelect(db *DB, inner *sqlparser.Select, outerRow Row) ([]Row, error) {
+	if len(inner.GroupBy) > 0 || selectHasAggregates(inner.SelectExprs) {
+		return nil, fmt.Errorf("IN (subquery): GROUP BY / aggregates are not supported yet")
+	}
+	if len(inner.OrderBy) > 0 || inner.Limit != nil {
+		return nil, fmt.Errorf("IN (subquery): ORDER BY / LIMIT are not supported yet")
+	}
+	if inner.Distinct == sqlparser.DistinctStr {
+		return nil, fmt.Errorf("IN (subquery): DISTINCT is not supported yet")
+	}
+	if inner.Having != nil {
+		return nil, fmt.Errorf("IN (subquery): HAVING is not supported yet")
+	}
+	if len(inner.SelectExprs) != 1 {
+		return nil, fmt.Errorf("IN (subquery): inner SELECT must have exactly one column")
+	}
+	if _, ok := inner.SelectExprs[0].(*sqlparser.StarExpr); ok {
+		return nil, fmt.Errorf("IN (subquery): use a single explicit column instead of SELECT *")
+	}
+	refs, _, err := extractFromClause(db, inner.From)
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("IN (subquery): no tables in FROM clause")
+	}
+	filtered, err := correlatedSubqueryFromWhere(db, inner, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	// Use qualified outer row for projection too, consistent with the WHERE step.
+	qualifiedOuter := qualifyOuterRow(db, outerRow)
+	out := make([]Row, 0, len(filtered))
+	for _, r := range filtered {
+		merged := mergeRowsOuter(qualifiedOuter, r)
+		pr, err := projectRow(db, merged, inner.SelectExprs, true)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pr)
+	}
+	return out, nil
+}
+
+// projectedSingleColumn returns the sole value from a one-column projected row.
+func projectedSingleColumn(row Row) (Value, error) {
+	if len(row) != 1 {
+		return Null, fmt.Errorf("subquery: expected one projected column, got %d", len(row))
+	}
+	for _, v := range row {
+		return v, nil
+	}
+	return Null, nil
+}
+
+// execScalarSubquery runs a scalar subquery (one column, zero or one row) with
+// outerRow merged as a correlation fallback. Supports the full SELECT pipeline:
+// FROM, JOINs, correlated WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT.
+// Returns NULL if the subquery produces no rows; errors if it produces 2 or more.
+func execScalarSubquery(db *DB, inner *sqlparser.Select, outerRow Row) (Value, error) {
+	if len(inner.SelectExprs) != 1 {
+		return Null, fmt.Errorf("scalar subquery must SELECT exactly one column, got %d", len(inner.SelectExprs))
+	}
+	if _, ok := inner.SelectExprs[0].(*sqlparser.StarExpr); ok {
+		return Null, fmt.Errorf("scalar subquery: use a single explicit column instead of SELECT *")
+	}
+
+	// FROM + JOINs + correlated WHERE.
+	// correlatedSubqueryFromWhere always qualifies inner-table column keys
+	// (e.g. "orders.id") so that bare outer keys (e.g. "id" from users) are
+	// never shadowed during merge-based correlation evaluation.
+	rows, err := correlatedSubqueryFromWhere(db, inner, outerRow)
+	if err != nil {
+		return Null, err
+	}
+
+	// GROUP BY / aggregates (e.g. SELECT COUNT(*) FROM …).
+	hasAgg := selectHasAggregates(inner.SelectExprs)
+	if len(inner.GroupBy) > 0 || hasAgg {
+		rows, err = applyGroupBy(db, rows, inner.GroupBy, inner.SelectExprs)
 		if err != nil {
 			return Null, err
 		}
-		return Value{Kind: KindBool, V: len(rows) > 0}, nil
+		if inner.Having != nil {
+			filtered := rows[:0]
+			for _, r := range rows {
+				merged := mergeRowsOuter(outerRow, r)
+				ok, herr := evalBoolWithDB(db, inner.Having.Expr, merged)
+				if herr != nil {
+					return Null, herr
+				}
+				if ok {
+					filtered = append(filtered, r)
+				}
+			}
+			rows = filtered
+		}
 	}
-	return evalExpr(expr, row)
+
+	// ORDER BY.
+	if len(inner.OrderBy) > 0 {
+		rows, err = enrichWithAliases(db, rows, inner.SelectExprs)
+		if err != nil {
+			return Null, err
+		}
+		if err = sortRows(db, rows, inner.OrderBy); err != nil {
+			return Null, err
+		}
+	}
+
+	// LIMIT.
+	if inner.Limit != nil {
+		rows, err = applyLimit(db, rows, inner.Limit)
+		if err != nil {
+			return Null, err
+		}
+	}
+
+	// Project — inner rows may have qualified keys; projectRow resolves via
+	// resolveColumn's suffix-search fallback so bare column names still work.
+	projected, err := projectRows(db, rows, inner.SelectExprs, true)
+	if err != nil {
+		return Null, err
+	}
+
+	if inner.Distinct == sqlparser.DistinctStr {
+		projected = distinctRows(projected)
+	}
+
+	switch len(projected) {
+	case 0:
+		return Null, nil
+	case 1:
+		return projectedSingleColumn(projected[0])
+	default:
+		return Null, fmt.Errorf("scalar subquery returned more than one row")
+	}
+}
+
+// evalExprWithDB evaluates an expression with database access for EXISTS and IN (subquery).
+func evalExprWithDB(db *DB, expr sqlparser.Expr, row Row) (Value, error) {
+	return evalExpr(db, expr, row)
 }
 
 // evalBoolWithDB evaluates a boolean expression, handling ExistsExpr at any
@@ -1176,28 +1469,25 @@ func evalBoolWithDB(db *DB, expr sqlparser.Expr, row Row) (bool, error) {
 		}
 		return evalBoolWithDB(db, e.Right, row)
 	case *sqlparser.OrExpr:
-		left, err := evalBoolWithDB(db, e.Left, row)
+		v, err := evalOrPipe(db, e, row)
 		if err != nil {
 			return false, err
 		}
-		if left {
-			return true, nil
-		}
-		return evalBoolWithDB(db, e.Right, row)
+		return isTruthy(v), nil
 	case *sqlparser.NotExpr:
 		v, err := evalBoolWithDB(db, e.Expr, row)
 		return !v, err
 	case *sqlparser.ParenExpr:
 		return evalBoolWithDB(db, e.Expr, row)
 	}
-	return evalBool(expr, row)
+	return evalBool(db, expr, row)
 }
 
 // ─── EXPRESSION EVALUATION ───────────────────────────────────────────────────
 
 // evalBool evaluates an expression and returns its boolean truth value.
-func evalBool(expr sqlparser.Expr, row Row) (bool, error) {
-	val, err := evalExpr(expr, row)
+func evalBool(db *DB, expr sqlparser.Expr, row Row) (bool, error) {
+	val, err := evalExpr(db, expr, row)
 	if err != nil {
 		return false, err
 	}
@@ -1225,7 +1515,7 @@ func isTruthy(v Value) bool {
 }
 
 // evalExpr evaluates a SQL expression against a working row and returns a Value.
-func evalExpr(expr sqlparser.Expr, row Row) (Value, error) {
+func evalExpr(db *DB, expr sqlparser.Expr, row Row) (Value, error) {
 	if row == nil {
 		row = Row{}
 	}
@@ -1243,55 +1533,59 @@ func evalExpr(expr sqlparser.Expr, row Row) (Value, error) {
 		v, _ := resolveColumn(e, row)
 		return v, nil
 
+	case *sqlparser.ExistsExpr:
+		rows, err := execSelectCorrelated(db, e, row)
+		if err != nil {
+			return Null, err
+		}
+		return Value{Kind: KindBool, V: len(rows) > 0}, nil
+
+	case *sqlparser.Subquery:
+		// Scalar subquery: (SELECT expr FROM …) — must produce 0 or 1 rows.
+		inner, ok := e.Select.(*sqlparser.Select)
+		if !ok {
+			return Null, fmt.Errorf("scalar subquery: UNION is not supported")
+		}
+		return execScalarSubquery(db, inner, row)
+
 	case *sqlparser.ComparisonExpr:
-		return evalComparison(e, row)
+		return evalComparison(db, e, row)
 
 	case *sqlparser.AndExpr:
-		left, err := evalExpr(e.Left, row)
+		left, err := evalExpr(db, e.Left, row)
 		if err != nil {
 			return Null, err
 		}
 		if !isTruthy(left) {
 			return Value{Kind: KindBool, V: false}, nil
 		}
-		right, err := evalExpr(e.Right, row)
+		right, err := evalExpr(db, e.Right, row)
 		if err != nil {
 			return Null, err
 		}
 		return Value{Kind: KindBool, V: isTruthy(right)}, nil
 
 	case *sqlparser.OrExpr:
-		left, err := evalExpr(e.Left, row)
-		if err != nil {
-			return Null, err
-		}
-		if isTruthy(left) {
-			return Value{Kind: KindBool, V: true}, nil
-		}
-		right, err := evalExpr(e.Right, row)
-		if err != nil {
-			return Null, err
-		}
-		return Value{Kind: KindBool, V: isTruthy(right)}, nil
+		return evalOrPipe(db, e, row)
 
 	case *sqlparser.NotExpr:
-		val, err := evalExpr(e.Expr, row)
+		val, err := evalExpr(db, e.Expr, row)
 		if err != nil {
 			return Null, err
 		}
 		return Value{Kind: KindBool, V: !isTruthy(val)}, nil
 
 	case *sqlparser.IsExpr:
-		return evalIsExpr(e, row)
+		return evalIsExpr(db, e, row)
 
 	case *sqlparser.ParenExpr:
-		return evalExpr(e.Expr, row)
+		return evalExpr(db, e.Expr, row)
 
 	case *sqlparser.BinaryExpr:
-		return evalBinaryArith(e, row)
+		return evalBinaryArith(db, e, row)
 
 	case *sqlparser.UnaryExpr:
-		val, err := evalExpr(e.Expr, row)
+		val, err := evalExpr(db, e.Expr, row)
 		if err != nil {
 			return Null, err
 		}
@@ -1318,21 +1612,34 @@ func evalExpr(expr sqlparser.Expr, row Row) (Value, error) {
 			}
 			return Null, nil
 		}
-		return evalScalarFunc(e, row)
+		return evalScalarFunc(db, e, row)
 
 	case *sqlparser.RangeCond:
-		return evalRangeCond(e, row)
+		return evalRangeCond(db, e, row)
 
 	case *sqlparser.CaseExpr:
-		return evalCaseExpr(e, row)
+		return evalCaseExpr(db, e, row)
 
 	case *sqlparser.IntervalExpr:
 		// INTERVAL n UNIT — evaluated to a string "n UNIT" consumed by DATE_ADD/DATE_SUB.
-		v, err := evalExpr(e.Expr, row)
+		v, err := evalExpr(db, e.Expr, row)
 		if err != nil {
 			return Null, err
 		}
 		return Value{Kind: KindString, V: valueString(v) + " " + strings.ToUpper(e.Unit)}, nil
+
+	case *sqlparser.ConvertExpr:
+		return evalConvertExpr(db, e, row)
+
+	case *sqlparser.ConvertUsingExpr:
+		v, err := evalExpr(db, e.Expr, row)
+		if err != nil {
+			return Null, err
+		}
+		if v.Kind == KindNull {
+			return Null, nil
+		}
+		return Value{Kind: KindString, V: valueString(v)}, nil
 
 	case sqlparser.ValTuple:
 		// ValTuples appear as the RHS of IN; they should not be evaluated standalone.
@@ -1343,20 +1650,226 @@ func evalExpr(expr sqlparser.Expr, row Row) (Value, error) {
 	}
 }
 
+func evalConvertExpr(db *DB, e *sqlparser.ConvertExpr, row Row) (Value, error) {
+	v, err := evalExpr(db, e.Expr, row)
+	if err != nil {
+		return Null, err
+	}
+	if v.Kind == KindNull || e.Type == nil {
+		return v, nil
+	}
+	return castValueToConvertType(v, e.Type)
+}
+
+// castValueToConvertType implements CAST(expr AS type) / CONVERT(expr, type)
+// for the common targets used in portable SQL.
+func castValueToConvertType(v Value, ct *sqlparser.ConvertType) (Value, error) {
+	raw := strings.ToLower(strings.TrimSpace(ct.Type))
+
+	if strings.Contains(raw, "unsigned") {
+		return castSQLInt(v, true)
+	}
+	if strings.Contains(raw, "bool") {
+		return castSQLBool(v), nil
+	}
+	if strings.Contains(raw, "double") || strings.Contains(raw, "float") || raw == "real" ||
+		strings.HasPrefix(raw, "decimal") || strings.HasPrefix(raw, "numeric") {
+		return castSQLFloat(v)
+	}
+	if strings.Contains(raw, "char") || raw == "text" || strings.HasPrefix(raw, "nchar") ||
+		strings.HasPrefix(raw, "nvarchar") || strings.HasPrefix(raw, "binary") {
+		return Value{Kind: KindString, V: valueString(v)}, nil
+	}
+	if strings.Contains(raw, "datetime") || strings.Contains(raw, "timestamp") {
+		return castSQLDateTime(v)
+	}
+	if raw == "date" || strings.HasPrefix(raw, "date(") {
+		return castSQLDate(v)
+	}
+	if raw == "time" || strings.HasPrefix(raw, "time(") {
+		return castSQLTime(v)
+	}
+	if strings.Contains(raw, "int") || strings.Contains(raw, "signed") || raw == "integer" ||
+		raw == "bigint" || raw == "smallint" || raw == "tinyint" {
+		return castSQLInt(v, false)
+	}
+	return Null, fmt.Errorf("CAST/CONVERT: unsupported type %q", ct.Type)
+}
+
+func castSQLInt(v Value, unsigned bool) (Value, error) {
+	if v.Kind == KindNull {
+		return Null, nil
+	}
+	var n int64
+	switch v.Kind {
+	case KindInt:
+		n = v.V.(int64)
+	case KindFloat:
+		n = int64(v.V.(float64))
+	case KindBool:
+		if v.V.(bool) {
+			n = 1
+		}
+	case KindString:
+		s := strings.TrimSpace(v.V.(string))
+		if unsigned {
+			u, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				n = 0
+			} else {
+				n = int64(u)
+			}
+		} else {
+			var err error
+			n, err = strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				n = 0
+			}
+		}
+	case KindDate:
+		t := v.V.(time.Time).UTC()
+		n = int64(t.Year())*10000 + int64(t.Month())*100 + int64(t.Day())
+	default:
+		n = 0
+	}
+	if unsigned && n < 0 {
+		n = 0
+	}
+	return Value{Kind: KindInt, V: n}, nil
+}
+
+func castSQLFloat(v Value) (Value, error) {
+	if v.Kind == KindNull {
+		return Null, nil
+	}
+	switch v.Kind {
+	case KindFloat:
+		return v, nil
+	case KindInt:
+		return Value{Kind: KindFloat, V: float64(v.V.(int64))}, nil
+	case KindBool:
+		if v.V.(bool) {
+			return Value{Kind: KindFloat, V: 1}, nil
+		}
+		return Value{Kind: KindFloat, V: 0}, nil
+	case KindString:
+		f, err := strconv.ParseFloat(strings.TrimSpace(v.V.(string)), 64)
+		if err != nil {
+			return Value{Kind: KindFloat, V: 0}, nil
+		}
+		return Value{Kind: KindFloat, V: f}, nil
+	case KindDate:
+		return Value{Kind: KindFloat, V: float64(v.V.(time.Time).Unix())}, nil
+	default:
+		return Value{Kind: KindFloat, V: 0}, nil
+	}
+}
+
+func castSQLBool(v Value) Value {
+	if v.Kind == KindNull {
+		return Null
+	}
+	return Value{Kind: KindBool, V: isTruthy(v)}
+}
+
+func castSQLDate(v Value) (Value, error) {
+	if v.Kind == KindNull {
+		return Null, nil
+	}
+	switch v.Kind {
+	case KindDate:
+		t := v.V.(time.Time).UTC()
+		trunc := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+		return Value{Kind: KindDate, V: trunc}, nil
+	case KindString:
+		if t, ok := tryParseDate(strings.TrimSpace(v.V.(string))); ok {
+			utc := t.UTC()
+			trunc := time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC)
+			return Value{Kind: KindDate, V: trunc}, nil
+		}
+		return Null, nil
+	default:
+		return Null, nil
+	}
+}
+
+func castSQLDateTime(v Value) (Value, error) {
+	if v.Kind == KindNull {
+		return Null, nil
+	}
+	switch v.Kind {
+	case KindDate:
+		return v, nil
+	case KindString:
+		if t, ok := tryParseDate(strings.TrimSpace(v.V.(string))); ok {
+			return Value{Kind: KindDate, V: t.UTC()}, nil
+		}
+		return Null, nil
+	default:
+		return Null, nil
+	}
+}
+
+func castSQLTime(v Value) (Value, error) {
+	if v.Kind == KindNull {
+		return Null, nil
+	}
+	clock := func(t time.Time) Value {
+		u := t.UTC()
+		ref := time.Date(2000, 1, 1, u.Hour(), u.Minute(), u.Second(), u.Nanosecond(), time.UTC)
+		return Value{Kind: KindDate, V: ref}
+	}
+	switch v.Kind {
+	case KindString:
+		s := strings.TrimSpace(v.V.(string))
+		for _, f := range []string{"15:04:05", "15:04"} {
+			if t, err := time.Parse(f, s); err == nil {
+				return clock(t), nil
+			}
+		}
+		if t, ok := tryParseDate(s); ok {
+			return clock(t), nil
+		}
+		return Null, nil
+	case KindDate:
+		return clock(v.V.(time.Time)), nil
+	default:
+		return Null, nil
+	}
+}
+
 // resolveColumn looks up a column in the working row, handling qualified names.
 func resolveColumn(col *sqlparser.ColName, row Row) (Value, bool) {
 	qualifier := col.Qualifier.Name.String()
 	name := col.Name.Lowered()
 
 	if qualifier != "" {
+		// Exact qualified lookup: "alias.col"
 		if v, ok := row[qualifier+"."+name]; ok {
 			return v, true
 		}
+		// Bare name fallback (column stored without alias, e.g. in a derived table).
+		if v, ok := row[name]; ok {
+			return v, true
+		}
+		// Suffix search only for a qualified reference: accept keys where the
+		// qualifier part itself matches (handles "tableName.col" when written as
+		// "alias.col" where alias == tableName). Do NOT accept keys from other
+		// tables — that would shadow e.g. a null-padded left row with a value
+		// from the right row in an outer join.
+		suffix := "." + qualifier + "." + name // e.g. ".employees.id" for "e.id"
+		for k, v := range row {
+			if strings.HasSuffix(k, suffix) {
+				return v, true
+			}
+		}
+		return Null, false
 	}
+
+	// Unqualified reference: check bare name then any "alias.col" key.
 	if v, ok := row[name]; ok {
 		return v, true
 	}
-	// Last resort: search for any "alias.name" key.
 	suffix := "." + name
 	for k, v := range row {
 		if strings.HasSuffix(k, suffix) {
@@ -1408,36 +1921,52 @@ func parseSQLVal(sv *sqlparser.SQLVal) (Value, error) {
 	}
 }
 
-func evalComparison(e *sqlparser.ComparisonExpr, row Row) (Value, error) {
+func evalComparison(db *DB, e *sqlparser.ComparisonExpr, row Row) (Value, error) {
 	op := e.Operator
 
 	// IN / NOT IN
 	if op == "in" || op == "not in" {
-		left, err := evalExpr(e.Left, row)
+		left, err := evalExpr(db, e.Left, row)
 		if err != nil {
 			return Null, err
 		}
-		tuple, ok := e.Right.(sqlparser.ValTuple)
-		if !ok {
-			return Null, fmt.Errorf("expected value list for IN, got %T", e.Right)
-		}
-		for _, item := range tuple {
-			val, err := evalExpr(item, row)
+		switch rhs := e.Right.(type) {
+		case sqlparser.ValTuple:
+			for _, item := range rhs {
+				val, err := evalExpr(db, item, row)
+				if err != nil {
+					return Null, err
+				}
+				if Equal(left, val) {
+					return Value{Kind: KindBool, V: op == "in"}, nil
+				}
+			}
+			return Value{Kind: KindBool, V: op == "not in"}, nil
+		case *sqlparser.Subquery:
+			subRows, err := execSelectForIn(db, rhs, row)
 			if err != nil {
 				return Null, err
 			}
-			if Equal(left, val) {
-				return Value{Kind: KindBool, V: op == "in"}, nil
+			for _, pr := range subRows {
+				val, err := projectedSingleColumn(pr)
+				if err != nil {
+					return Null, err
+				}
+				if Equal(left, val) {
+					return Value{Kind: KindBool, V: op == "in"}, nil
+				}
 			}
+			return Value{Kind: KindBool, V: op == "not in"}, nil
+		default:
+			return Null, fmt.Errorf("expected value list or subquery for IN, got %T", e.Right)
 		}
-		return Value{Kind: KindBool, V: op == "not in"}, nil
 	}
 
-	left, err := evalExpr(e.Left, row)
+	left, err := evalExpr(db, e.Left, row)
 	if err != nil {
 		return Null, err
 	}
-	right, err := evalExpr(e.Right, row)
+	right, err := evalExpr(db, e.Right, row)
 	if err != nil {
 		return Null, err
 	}
@@ -1447,7 +1976,30 @@ func evalComparison(e *sqlparser.ComparisonExpr, row Row) (Value, error) {
 		if left.Kind == KindNull || right.Kind == KindNull {
 			return Value{Kind: KindBool, V: false}, nil
 		}
-		match := LikeMatch(valueString(right), valueString(left))
+		pat := valueString(right)
+		val := valueString(left)
+		var match bool
+		if e.Escape != nil {
+			escVal, err := evalExpr(db, e.Escape, row)
+			if err != nil {
+				return Null, err
+			}
+			if escVal.Kind == KindNull {
+				return Value{Kind: KindBool, V: false}, nil
+			}
+			escStr := valueString(escVal)
+			if escStr == "" {
+				// ESCAPE '' — treat as no escape character (PostgreSQL-compatible).
+				match = LikeMatch(pat, val)
+			} else if utf8.RuneCountInString(escStr) != 1 {
+				return Null, fmt.Errorf("LIKE ESCAPE must be exactly one character")
+			} else {
+				escR, _ := utf8.DecodeRuneInString(escStr)
+				match = LikeMatchEscape(pat, val, escR)
+			}
+		} else {
+			match = LikeMatch(pat, val)
+		}
 		if op == "not like" {
 			match = !match
 		}
@@ -1480,8 +2032,8 @@ func evalComparison(e *sqlparser.ComparisonExpr, row Row) (Value, error) {
 	return Value{Kind: KindBool, V: result}, nil
 }
 
-func evalIsExpr(e *sqlparser.IsExpr, row Row) (Value, error) {
-	val, err := evalExpr(e.Expr, row)
+func evalIsExpr(db *DB, e *sqlparser.IsExpr, row Row) (Value, error) {
+	val, err := evalExpr(db, e.Expr, row)
 	if err != nil {
 		return Null, err
 	}
@@ -1505,17 +2057,49 @@ func evalIsExpr(e *sqlparser.IsExpr, row Row) (Value, error) {
 	return Value{Kind: KindBool, V: result}, nil
 }
 
-func evalBinaryArith(e *sqlparser.BinaryExpr, row Row) (Value, error) {
-	left, err := evalExpr(e.Left, row)
+// combinePipeOr implements PostgreSQL-style ||: concatenate when either operand
+// is a string; otherwise boolean OR (short-circuit truthiness on the left).
+func combinePipeOr(left, right Value) Value {
+	if left.Kind == KindNull || right.Kind == KindNull {
+		return Null
+	}
+	if left.Kind == KindString || right.Kind == KindString {
+		return Value{Kind: KindString, V: valueString(left) + valueString(right)}
+	}
+	if isTruthy(left) {
+		return Value{Kind: KindBool, V: true}
+	}
+	return Value{Kind: KindBool, V: isTruthy(right)}
+}
+
+func evalOrPipe(db *DB, e *sqlparser.OrExpr, row Row) (Value, error) {
+	left, err := evalExpr(db, e.Left, row)
 	if err != nil {
 		return Null, err
 	}
-	right, err := evalExpr(e.Right, row)
+	right, err := evalExpr(db, e.Right, row)
+	if err != nil {
+		return Null, err
+	}
+	return combinePipeOr(left, right), nil
+}
+
+func evalBinaryArith(db *DB, e *sqlparser.BinaryExpr, row Row) (Value, error) {
+	left, err := evalExpr(db, e.Left, row)
+	if err != nil {
+		return Null, err
+	}
+	right, err := evalExpr(db, e.Right, row)
 	if err != nil {
 		return Null, err
 	}
 	if left.Kind == KindNull || right.Kind == KindNull {
 		return Null, nil
+	}
+
+	// Parser may emit `||` as BinaryExpr in some contexts; match OrExpr / pipe rules.
+	if e.Operator == "||" {
+		return combinePipeOr(left, right), nil
 	}
 
 	// String concatenation with +
@@ -1556,8 +2140,8 @@ func evalBinaryArith(e *sqlparser.BinaryExpr, row Row) (Value, error) {
 	return Value{Kind: KindFloat, V: result}, nil
 }
 
-func evalRangeCond(e *sqlparser.RangeCond, row Row) (Value, error) {
-	val, err := evalExpr(e.Left, row)
+func evalRangeCond(db *DB, e *sqlparser.RangeCond, row Row) (Value, error) {
+	val, err := evalExpr(db, e.Left, row)
 	if err != nil {
 		return Null, err
 	}
@@ -1565,11 +2149,11 @@ func evalRangeCond(e *sqlparser.RangeCond, row Row) (Value, error) {
 	if val.Kind == KindNull {
 		return Value{Kind: KindBool, V: false}, nil
 	}
-	from, err := evalExpr(e.From, row)
+	from, err := evalExpr(db, e.From, row)
 	if err != nil {
 		return Null, err
 	}
-	to, err := evalExpr(e.To, row)
+	to, err := evalExpr(db, e.To, row)
 	if err != nil {
 		return Null, err
 	}
@@ -1580,17 +2164,17 @@ func evalRangeCond(e *sqlparser.RangeCond, row Row) (Value, error) {
 	return Value{Kind: KindBool, V: inRange}, nil
 }
 
-func evalCaseExpr(e *sqlparser.CaseExpr, row Row) (Value, error) {
+func evalCaseExpr(db *DB, e *sqlparser.CaseExpr, row Row) (Value, error) {
 	var base *Value
 	if e.Expr != nil {
-		v, err := evalExpr(e.Expr, row)
+		v, err := evalExpr(db, e.Expr, row)
 		if err != nil {
 			return Null, err
 		}
 		base = &v
 	}
 	for _, when := range e.Whens {
-		cond, err := evalExpr(when.Cond, row)
+		cond, err := evalExpr(db, when.Cond, row)
 		if err != nil {
 			return Null, err
 		}
@@ -1601,16 +2185,16 @@ func evalCaseExpr(e *sqlparser.CaseExpr, row Row) (Value, error) {
 			matched = isTruthy(cond)
 		}
 		if matched {
-			return evalExpr(when.Val, row)
+			return evalExpr(db, when.Val, row)
 		}
 	}
 	if e.Else != nil {
-		return evalExpr(e.Else, row)
+		return evalExpr(db, e.Else, row)
 	}
 	return Null, nil
 }
 
-func evalScalarFunc(e *sqlparser.FuncExpr, row Row) (Value, error) {
+func evalScalarFunc(db *DB, e *sqlparser.FuncExpr, row Row) (Value, error) {
 	name := e.Name.Lowered()
 
 	args := make([]Value, 0, len(e.Exprs))
@@ -1619,7 +2203,7 @@ func evalScalarFunc(e *sqlparser.FuncExpr, row Row) (Value, error) {
 		if !ok {
 			continue
 		}
-		v, err := evalExpr(ae.Expr, row)
+		v, err := evalExpr(db, ae.Expr, row)
 		if err != nil {
 			return Null, err
 		}

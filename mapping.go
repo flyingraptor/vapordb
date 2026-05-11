@@ -54,6 +54,10 @@ func (db *DB) InsertStruct(table string, v any) error {
 // ScanRows maps a []Row result into a typed slice using `db` struct tags.
 // T must be a struct; fields without a matching `db` tag are left at their
 // zero value. NULL columns are also left at their zero value.
+// Anonymous embedded struct (or *struct) fields are walked recursively so
+// promoted `db` tags on the embedded type are scanned like database/sql.
+// The embedded field must be exported (capitalized type name) so reflect
+// can assign through it from this package, matching normal Go visibility rules.
 //
 // Example:
 //
@@ -70,27 +74,82 @@ func ScanRows[T any](rows []Row) []T {
 		rt = rt.Elem()
 	}
 
-	// build column-name → field-index lookup once per call
-	tagIndex := make(map[string]int, rt.NumField())
-	for i := 0; i < rt.NumField(); i++ {
-		if tag := rt.Field(i).Tag.Get("db"); tag != "" && tag != "-" {
-			tagIndex[tag] = i
-		}
-	}
+	// column name → field index path (handles embedded anonymous structs).
+	tagPaths := collectDBTagPaths(rt)
 
 	result := make([]T, len(rows))
 	for i, row := range rows {
 		rv := reflect.New(rt).Elem()
 		for col, val := range row {
-			idx, ok := tagIndex[col]
+			path, ok := tagPaths[col]
 			if !ok || val.Kind == KindNull {
 				continue
 			}
-			setStructField(rv.Field(idx), val)
+			setFieldByPath(rv, path, val)
 		}
 		result[i] = rv.Interface().(T)
 	}
 	return result
+}
+
+// collectDBTagPaths maps lowered column names to struct field index paths.
+// Anonymous struct or *struct fields are walked recursively so promoted `db`
+// tags behave like database/sql / sqlx.
+func collectDBTagPaths(rt reflect.Type) map[string][]int {
+	out := make(map[string][]int)
+	collectDBTagPathsRec(rt, nil, out)
+	return out
+}
+
+func collectDBTagPathsRec(rt reflect.Type, prefix []int, out map[string][]int) {
+	for i := 0; i < rt.NumField(); i++ {
+		sf := rt.Field(i)
+		path := append(append([]int(nil), prefix...), i)
+
+		// Anonymous embedded fields may be unexported (e.g. `baseFilter`); still
+		// walk them so promoted `db` tags work when the caller package matches.
+		if sf.Anonymous {
+			switch sf.Type.Kind() {
+			case reflect.Struct:
+				collectDBTagPathsRec(sf.Type, path, out)
+				continue
+			case reflect.Pointer:
+				if sf.Type.Elem().Kind() == reflect.Struct {
+					collectDBTagPathsRec(sf.Type.Elem(), path, out)
+					continue
+				}
+			}
+		}
+
+		if !sf.IsExported() {
+			continue
+		}
+
+		tag := sf.Tag.Get("db")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		out[strings.ToLower(tag)] = path
+	}
+}
+
+// setFieldByPath walks rv to path[len-1] (allocating nil pointer embeds) then
+// writes val into the leaf field via setStructField.
+func setFieldByPath(root reflect.Value, path []int, val Value) {
+	if len(path) == 0 {
+		return
+	}
+	cur := root
+	for _, idx := range path[:len(path)-1] {
+		cur = cur.Field(idx)
+		if cur.Kind() == reflect.Pointer {
+			if cur.IsNil() {
+				cur.Set(reflect.New(cur.Type().Elem()))
+			}
+			cur = cur.Elem()
+		}
+	}
+	setStructField(cur.Field(path[len(path)-1]), val)
 }
 
 // ── internal helpers ──────────────────────────────────────────────────────────

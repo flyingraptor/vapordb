@@ -1,6 +1,12 @@
 package vapordb
 
-import "testing"
+import (
+	"errors"
+	"net"
+	"strings"
+	"testing"
+	"time"
+)
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
 
@@ -146,6 +152,24 @@ func TestNamedQueryWithStructPointer(t *testing.T) {
 	}
 }
 
+func TestNamedQueryEmbeddedStructParams(t *testing.T) {
+	type BaseFilter struct {
+		MinAge int `db:"min"`
+	}
+	type filter struct {
+		BaseFilter
+		ExcludeName string `db:"name"`
+	}
+	db := namedDB(t)
+	rows := queryNamed(t, db,
+		`SELECT id FROM users WHERE age >= :min AND name != :name ORDER BY id`,
+		filter{BaseFilter: BaseFilter{MinAge: 28}, ExcludeName: "Dave"},
+	)
+	if len(rows) != 2 {
+		t.Errorf("embedded struct params: want 2 rows, got %d: %v", len(rows), rows)
+	}
+}
+
 // ── ExecNamed ────────────────────────────────────────────────────────────────
 
 func TestNamedExecInsert(t *testing.T) {
@@ -212,6 +236,59 @@ func TestNamedParamInsideStringLiteralNotReplaced(t *testing.T) {
 	// all 4 rows have name != ':age' literal string
 	if len(rows) != 4 {
 		t.Errorf("literal string: want 4 rows, got %d", len(rows))
+	}
+}
+
+// ── TextMarshaler / fmt.Stringer / time (e.g. uuid.UUID, net.IP) ─────────────
+
+// namedUUIDStub mirrors github.com/google/uuid.UUID: [16]byte + TextMarshaler.
+type namedUUIDStub [16]byte
+
+func (namedUUIDStub) MarshalText() ([]byte, error) {
+	return []byte("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), nil
+}
+
+func TestNamedQueryTextMarshalerUUIDLike(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO docs (id, body) VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'ok')`)
+	var id namedUUIDStub
+	rows := queryNamed(t, db, `SELECT body FROM docs WHERE id = :id`, map[string]any{"id": id})
+	if len(rows) != 1 || rows[0]["body"] != strVal("ok") {
+		t.Fatalf("want one row body=ok, got %v", rows)
+	}
+}
+
+func TestNamedQueryNetIP(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO hosts (addr) VALUES ('192.0.2.1')`)
+	ip := net.ParseIP("192.0.2.1")
+	rows := queryNamed(t, db, `SELECT addr FROM hosts WHERE addr = :ip`, map[string]any{"ip": ip})
+	if len(rows) != 1 || rows[0]["addr"] != strVal("192.0.2.1") {
+		t.Fatalf("want one row addr 192.0.2.1, got %v", rows)
+	}
+}
+
+func TestNamedQueryTimeParam(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO evt (id, ts) VALUES (1, DATE('2024-06-01 00:00:00'))`)
+	ts := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	rows := queryNamed(t, db, `SELECT id FROM evt WHERE ts = :ts`, map[string]any{"ts": ts})
+	if len(rows) != 1 || rows[0]["id"] != intVal(1) {
+		t.Fatalf("want id=1, got %v", rows)
+	}
+}
+
+type badMarshal struct{}
+
+func (badMarshal) MarshalText() ([]byte, error) {
+	return nil, errors.New("marshal failed")
+}
+
+func TestNamedParamMarshalTextError(t *testing.T) {
+	db := New()
+	_, err := db.QueryNamed(`SELECT 1 AS n FROM DUAL WHERE 1 = :x`, map[string]any{"x": badMarshal{}})
+	if err == nil || !strings.Contains(err.Error(), "MarshalText") {
+		t.Fatalf("want MarshalText error, got %v", err)
 	}
 }
 

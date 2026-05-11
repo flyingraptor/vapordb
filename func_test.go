@@ -587,6 +587,66 @@ func TestUnaryMinus(t *testing.T) {
 	}
 }
 
+// ─── `||` pipe (parser OrExpr): string concat when a string is involved, else OR ─
+
+func TestPipeOrStringConcatChained(t *testing.T) {
+	db := New()
+	rows := mustQuery(t, db, `SELECT '%'||'x'||'%' AS p FROM DUAL`)
+	if rows[0]["p"] != strVal("%x%") {
+		t.Fatalf("want %%x%%, got %v", rows[0]["p"])
+	}
+}
+
+func TestPipeOrLikePattern(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO t (name) VALUES ('hello')`)
+	mustExec(t, db, `INSERT INTO t (name) VALUES ('goodbye')`)
+	// Parentheses keep the pattern as one expression; without them this parser
+	// treats `like a||b` like `like a or b` at the LIKE precedence boundary.
+	rows := mustQuery(t, db, `SELECT name FROM t WHERE name LIKE ('%'||'hell'||'%')`)
+	if len(rows) != 1 || rows[0]["name"] != strVal("hello") {
+		t.Fatalf("want one row hello, got %+v", rows)
+	}
+}
+
+func TestPipeOrNumericBooleanOr(t *testing.T) {
+	db := New()
+	rows := mustQuery(t, db, `SELECT 0||1 AS a, 1||0 AS b, 0||0 AS c FROM DUAL`)
+	if rows[0]["a"] != boolVal(true) {
+		t.Fatalf("0||1: want true, got %v", rows[0]["a"])
+	}
+	if rows[0]["b"] != boolVal(true) {
+		t.Fatalf("1||0: want true, got %v", rows[0]["b"])
+	}
+	if rows[0]["c"] != boolVal(false) {
+		t.Fatalf("0||0: want false, got %v", rows[0]["c"])
+	}
+}
+
+func TestPipeOrNullWithString(t *testing.T) {
+	db := New()
+	rows := mustQuery(t, db, `SELECT NULL||'x' AS p, 'x'||NULL AS q FROM DUAL`)
+	if rows[0]["p"].Kind != KindNull || rows[0]["q"].Kind != KindNull {
+		t.Fatalf("want NULL NULL, got %v %v", rows[0]["p"], rows[0]["q"])
+	}
+}
+
+func TestPipeOrBothStringsConcat(t *testing.T) {
+	db := New()
+	rows := mustQuery(t, db, `SELECT 'a'||'b' AS p FROM DUAL`)
+	if rows[0]["p"] != strVal("ab") {
+		t.Fatalf("want ab, got %v", rows[0]["p"])
+	}
+}
+
+func TestPipeOrWhereNumericTruth(t *testing.T) {
+	db := New()
+	rows := mustQuery(t, db, `SELECT 1 AS n FROM DUAL WHERE 0||1`)
+	if len(rows) != 1 {
+		t.Fatalf("WHERE 0||1: want one row, got %d", len(rows))
+	}
+}
+
 // ─── combined: COALESCE + CASE + aggregate in one query ───────────────────────
 
 func TestCombinedFunctions(t *testing.T) {

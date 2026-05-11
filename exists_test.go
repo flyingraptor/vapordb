@@ -151,3 +151,26 @@ func TestExistsUncorrelated(t *testing.T) {
 		t.Fatalf("want 2, got %d", len(rows))
 	}
 }
+
+// Single-table outer FROM with an explicit alias: outer columns must stay
+// qualified as alias.col so correlated r.id does not resolve to the inner
+// table's bare id (same column name).
+func TestExistsCorrelatedOuterTableAlias(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO regions (id, name) VALUES (10, 'North'), (20, 'South')`)
+	mustExec(t, db, `INSERT INTO region_cities (id, region_id, name) VALUES (1, 10, 'A'), (2, 99, 'B'), (3, 10, 'C')`)
+
+	rows := mustQuery(t, db, `
+		SELECT r.id FROM regions r
+		WHERE EXISTS (
+			SELECT 1 FROM region_cities rc
+			WHERE rc.region_id = r.id AND rc.id = 1
+		)
+		ORDER BY r.id`)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 region (only North has city id=1 pointing at it), got %d rows", len(rows))
+	}
+	if rows[0]["id"].V.(int64) != 10 {
+		t.Fatalf("want region id 10, got %v", rows[0]["id"])
+	}
+}

@@ -21,18 +21,18 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 
 - **Zero setup.** No CREATE TABLE, no migrations. Schema is inferred from the first INSERT.
 - **Automatic schema evolution.** New columns are added on the fly. Safe type widening (e.g. `int` to `float`) happens automatically.
-- **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
-- **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE, arithmetic, and more.
-- **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported.
-- **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM`, `AVG`, `MIN`, `MAX` with `OVER([PARTITION BY …] [ORDER BY …])`.
-- **`RETURNING` clause.** Append `RETURNING col1, col2` (or `RETURNING *`) to any `INSERT`, `UPDATE`, or `DELETE` and call `db.Query(…)` to get back the affected rows. For INSERT the returned rows are the newly inserted rows. For UPDATE the rows are in their post-update state. For DELETE the rows are in their pre-deletion state.
+- **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, INNER / LEFT / RIGHT / FULL OUTER JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
+- **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE (including `ESCAPE`), `CAST` / `CONVERT`, string concat with `||` (PostgreSQL-style when a string operand is involved; otherwise boolean OR), arithmetic, and more.
+- **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported. Combine with `RETURNING` on the same `INSERT` to read inserted or updated rows.
+- **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `NTILE`, `CUME_DIST`, `PERCENT_RANK` with `OVER([PARTITION BY …] [ORDER BY …] [frame])`. ROWS and RANGE frames supported. Outer `LIMIT` / `OFFSET` are applied *after* window results so aggregates such as `COUNT(*) OVER()` see the full row set.
+- **`RETURNING` clause.** Append `RETURNING col1, col2` (or `RETURNING *`) to `INSERT`, `UPDATE`, `DELETE`, or an upsert `INSERT … ON CONFLICT …` and call `db.Query(…)` to get back the affected rows. Plain INSERT returns new rows; upsert `DO UPDATE` returns one projected row per `VALUES` tuple in order (updated or inserted); `DO NOTHING` omits skipped tuples. UPDATE / DELETE behaviour is unchanged.
 - **CTEs (`WITH … AS (…) SELECT …`).** One or more named subqueries before the main SELECT. Later CTEs can reference earlier ones. CTE names act as virtual tables for the main query, `JOIN`s, `EXISTS` subqueries, and derived tables.
 - **`UNION` / `UNION ALL`.** Combine result sets from multiple SELECTs, with optional `ORDER BY` / `LIMIT` on the combined result.
 - **Subqueries in `FROM`.** `SELECT … FROM (SELECT …) AS sub` — derived tables, including joins against derived tables and nested subqueries.
 - **`SELECT EXISTS (subquery)`.** Correlated and uncorrelated, in `WHERE` and as a projected column.
 - **Date support.** `KindDate` type backed by `time.Time`. Date literals, comparisons, BETWEEN, ORDER BY, and date functions (NOW, CURDATE, DATE, YEAR, MONTH, DAY, DATEDIFF, DATE_ADD, DATE_FORMAT, …). String literals auto-coerce when compared against date columns.
-- **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct. Slice values expand automatically, so `= ANY(:ids)` with `[]int{1,2,3}` becomes `IN (1, 2, 3)`.
-- **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
+- **Named parameters.** `:param` placeholders in any SQL statement via `db.QueryNamed` / `db.ExecNamed`. Accepts `map[string]any` or a `db`-tagged struct. Slice values expand automatically, so `= ANY(:ids)` with `[]int{1,2,3}` becomes `IN (1, 2, 3)`. Map / struct fields may use `time.Time`, `database/sql/driver.Valuer`, `encoding.TextMarshaler`, and `fmt.Stringer` values (e.g. `uuid.UUID`, `net.IP`) without calling `.String()` by hand.
+- **Struct mapping.** Insert from structs and scan results back into typed slices via `db` tags. Anonymous embedded structs are walked so promoted `db`-tagged fields behave like `database/sql`. Pointer fields, `sql.NullString` / `sql.Null*`, `fmt.Stringer`, `encoding.TextUnmarshaler`, and custom `driver.Valuer` / `sql.Scanner` types all round-trip automatically.
 - **Enum constraints.** `db.DeclareEnum(table, col, vals...)` restricts a column to a declared set of string values. INSERTs and UPDATEs that supply a value outside the set are rejected with an error. Calling `DeclareEnum` again on the same column widens the set (new variants are added; existing ones are never removed). NULL is always accepted. Constraints survive `Save` / `Load`.
 - **Schema locking.** `db.LockTable(name)` / `db.LockSchema()` freeze a table's schema. Any INSERT that would add a new column, widen a type, or trigger an unsafe type change is rejected with an error. `db.UnlockTable` / `db.UnlockSchema` re-enable evolution. Lock state persists through `Save` / `Load`.
 - **Query log.** After the first `db.Save("db.json")` or `db.Load("db.json")`, every `Exec` and `Query` call is automatically appended to a companion `db_queries.jsonl` file (JSON Lines). Each entry records the timestamp, operation, SQL, duration in ms, row count, and any error. Zero setup — the log starts automatically alongside the snapshot.
@@ -75,6 +75,7 @@ func main() {
 | Method | Description |
 |--------|-------------|
 | `vapordb.New()` | Create a new empty database |
+| `vapordb.New(vapordb.WithForceWipeOnSchemaConflict(true))` | Opt in to the legacy behaviour of wiping a table’s rows when an INSERT would change an existing column’s type family (default is to return an error). Per-call overrides use `vapordb.WithWriteForceWipeOnSchemaConflict` on `Query`, `Exec`, `QueryNamed`, and `ExecNamed`. |
 | `db.Exec(sql)` | Run INSERT, UPDATE, or DELETE |
 | `db.Query(sql)` | Run SELECT, returns `[]Row` |
 | `db.Save(path)` | Persist the database to a JSON file |
@@ -106,7 +107,7 @@ db.Exec(`INSERT INTO events (id, name, score) VALUES (2, 'beta', 9.5)`)
 // previous row gets score = NULL automatically
 ```
 
-Type widening is safe and automatic (`bool` to `int` to `float`). Crossing into a different family (e.g. a column that was `int` now receives a `string`) wipes the table and starts fresh with the new type.
+Type widening is safe and automatic (`bool` to `int` to `float`). Crossing into a different type family on an existing column (for example inserting a string into a column that was numeric) **returns an error by default** so seed data mistakes do not silently delete rows. Pass `vapordb.WithForceWipeOnSchemaConflict(true)` to `New`, or `vapordb.WithWriteForceWipeOnSchemaConflict(true)` on a single `Exec` / `Query` / `ExecNamed` / `QueryNamed`, to restore the previous wipe-and-replace behaviour when you need it.
 
 ## Struct Mapping
 
@@ -203,6 +204,25 @@ tasks := vapordb.ScanRows[Task](mustQuery(db, `SELECT id, status FROM tasks`))
 
 Types implementing `fmt.Stringer` and `encoding.TextUnmarshaler` (such as `net.IP` or `uuid.UUID`) also round-trip without any extra code.
 
+### Embedded struct fields
+
+Anonymous embedded structs (and pointers to structs) are expanded when resolving `db` tags, matching the usual `database/sql` / `sqlx` behaviour. The embedded type name must be exported so `reflect` can see the promoted fields.
+
+```go
+type Base struct {
+    ID   int    `db:"id"`
+    Name string `db:"name"`
+}
+
+type UserRow struct {
+    Base
+    Score int `db:"score"`
+}
+
+rows, _ := db.Query(`SELECT id, name, score FROM users WHERE id = 1`)
+users := vapordb.ScanRows[UserRow](rows)
+```
+
 ## Named Parameters
 
 Use `:name` placeholders instead of inlining values into SQL strings. Pass either a `map[string]any` or a struct with `db` tags.
@@ -243,6 +263,27 @@ db.QueryNamed(
 // expands to: WHERE id IN (10, 20, 30)
 ```
 
+### Named parameters and custom Go types
+
+Besides primitives and slices, map / struct fields passed to `QueryNamed` / `ExecNamed` may use:
+
+- `time.Time` (serialized consistently with struct inserts, e.g. `DATE('…')` where appropriate)
+- `database/sql/driver.Valuer` (the `driver.Value` is turned into a SQL literal)
+- `encoding.TextMarshaler` (for example `uuid.UUID` from `google/uuid`)
+- `fmt.Stringer` (for example `net.IP`)
+
+```go
+import "net"
+
+ip := net.ParseIP("192.0.2.1")
+rows, err := db.QueryNamed(
+    `SELECT * FROM hosts WHERE addr = :ip`,
+    map[string]any{"ip": ip},
+)
+```
+
+Types such as `uuid.UUID` (`github.com/google/uuid`) work the same way: they implement `encoding.TextMarshaler` / `fmt.Stringer`, so you can pass them directly in the params map or struct.
+
 ## Persistence
 
 ```go
@@ -281,14 +322,32 @@ SELECT COUNT(DISTINCT label) FROM products
 ### JOINs
 
 ```sql
+-- INNER JOIN: only rows that match on both sides
 SELECT u.name, o.product
 FROM users u
 INNER JOIN orders o ON u.id = o.user_id
 
+-- LEFT JOIN: all left rows; NULL right columns when no match
 SELECT u.name, o.product
 FROM users u
 LEFT JOIN orders o ON u.id = o.user_id
 
+-- RIGHT JOIN: all right rows; NULL left columns when no match
+SELECT u.name, o.product
+FROM users u
+RIGHT JOIN orders o ON u.id = o.user_id
+
+-- FULL OUTER JOIN: all rows from both sides; NULLs on the missing side
+SELECT e.name, d.name
+FROM employees e
+FULL OUTER JOIN departments d ON e.dept_id = d.id
+
+-- FULL JOIN is a synonym
+SELECT e.name, d.name
+FROM employees e
+FULL JOIN departments d ON e.dept_id = d.id
+
+-- Multi-table chain
 SELECT u.name, p.title, c.body
 FROM users u
 INNER JOIN posts p ON p.author_id = u.id
@@ -304,12 +363,19 @@ WHERE name IN ('Alice', 'Bob')
 WHERE name NOT IN ('Alice', 'Bob')
 WHERE name LIKE 'A%'
 WHERE name LIKE '_lice'
+WHERE path LIKE '50#%' ESCAPE '#'          -- literal % in pattern (# is escape char)
+WHERE note LIKE 'x|_y' ESCAPE '|'         -- literal _ in pattern
+WHERE name LIKE 'hello' ESCAPE ''         -- empty ESCAPE: same wildcards as plain LIKE
+WHERE name NOT LIKE 'a#%b' ESCAPE '#'     -- NOT LIKE with escape
+WHERE label LIKE ('%' || 'needle' || '%') -- string concat; parenthesize when mixing LIKE and ||
 WHERE score IS NULL
 WHERE score IS NOT NULL
 WHERE age > 18 AND score >= 50
 WHERE age < 18 OR age > 65
 WHERE NOT (age = 25)
 ```
+
+Outside a `LIKE` pattern, `||` is evaluated as **string concatenation** when either operand is a string (PostgreSQL-style), and as **boolean OR** otherwise. When you combine `LIKE` with `||`, **parenthesize** the pattern (for example `LIKE ('%' || col || '%')`) so the parser does not split the expression at `LIKE` precedence.
 
 ### Scalar functions
 
@@ -322,8 +388,11 @@ IFNULL(score, 0)
 NULLIF(score, 0)
 ABS(balance)
 ROUND(price, 2), FLOOR(price), CEIL(price)
-CAST(age AS CHAR)
+CAST(age AS SIGNED), CAST(age AS DECIMAL(10,2))
+CAST(flag AS CHAR), CONVERT('2024-06-01' USING utf8mb4)
 ```
+
+`CAST` / `CONVERT` coerce values to the requested type where supported (numeric, string, date, bool). Parser limitations may require MySQL-oriented type names (for example `SIGNED` rather than `INTEGER`).
 
 ### Dates
 
@@ -399,7 +468,7 @@ DELETE FROM users WHERE age < 18
 
 ### RETURNING
 
-Append a `RETURNING` clause to `INSERT`, `UPDATE`, or `DELETE` and call `db.Query` to get the affected rows back.
+Append a `RETURNING` clause to `INSERT`, `UPDATE`, `DELETE`, or an **`INSERT … ON CONFLICT …`** upsert and call `db.Query` to get the affected rows back.
 
 ```sql
 -- INSERT: returns the rows just inserted (their final stored state)
@@ -408,6 +477,12 @@ db.Query(`INSERT INTO orders (id, user_id, total) VALUES (42, 1, 99.5) RETURNING
 
 -- Multi-row INSERT returns all inserted rows
 db.Query(`INSERT INTO tags (id, label) VALUES (1, 'go'), (2, 'sql'), (3, 'db') RETURNING id, label`)
+
+-- UPSERT: one row per VALUES tuple, in order (inserted or updated); skipped DO NOTHING tuples emit no row
+db.Query(`
+  INSERT INTO users (id, name) VALUES (1, 'bob')
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+  RETURNING id, name`)
 
 -- UPDATE: returns rows in their new state
 db.Query(`UPDATE users SET role = 'owner' WHERE id = 1 RETURNING id, role`)
@@ -465,9 +540,9 @@ FROM employees
 SELECT dept, name, COUNT(*) OVER(PARTITION BY dept) AS dept_size FROM employees
 ```
 
-Supported functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
+Supported functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `NTILE`, `CUME_DIST`, `PERCENT_RANK`.
 
-Window functions work inside CTEs, after `WHERE`, and can be mixed freely with other columns.
+Window functions work inside CTEs, after `WHERE`, and can be mixed freely with other columns. When a query uses both window functions and a top-level `LIMIT` / `OFFSET`, the limit is applied **after** window computation so `COUNT(*) OVER()` and similar aggregates see every row that passed the `WHERE` clause.
 
 ```sql
 -- Top earner per department using a CTE
@@ -477,6 +552,108 @@ WITH ranked AS (
   FROM employees
 )
 SELECT dept, name, salary FROM ranked WHERE rnk = 1
+```
+
+#### Window Frames
+
+The optional frame clause controls which rows are included in the aggregate/value computation for each row.
+
+```sql
+ROWS  BETWEEN <start> AND <end>
+RANGE BETWEEN <start> AND <end>
+```
+
+Supported bounds: `UNBOUNDED PRECEDING`, `N PRECEDING`, `CURRENT ROW`, `N FOLLOWING`, `UNBOUNDED FOLLOWING`.
+
+**Default frame** (when no explicit frame is written):
+- `OVER(ORDER BY …)` — `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (running aggregate, peers included).
+- `OVER()` or `OVER(PARTITION BY …)` with no ORDER BY — whole partition (`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`).
+
+```sql
+-- Running total (ROWS frame, offset-based)
+SELECT id, amount,
+       SUM(amount) OVER(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total
+FROM orders
+
+-- Running total using the standard default (ORDER BY without explicit frame)
+SELECT id, amount, SUM(amount) OVER(ORDER BY id) AS running_total FROM orders
+
+-- 3-row moving average centred on the current row
+SELECT id, amount,
+       AVG(amount) OVER(ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_avg
+FROM orders
+
+-- Cumulative count per row (incremental)
+SELECT id, COUNT(*) OVER(ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cnt
+FROM orders
+
+-- RANGE frame: running sum where tied ORDER BY values form a peer group
+SELECT id, score,
+       SUM(score) OVER(ORDER BY score RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rs
+FROM results
+```
+
+RANGE supports `UNBOUNDED PRECEDING`, `CURRENT ROW`, and `UNBOUNDED FOLLOWING` as bounds. RANGE with `N PRECEDING` / `N FOLLOWING` is not yet supported.
+
+#### Offset Functions — LAG / LEAD
+
+`LAG(col [, offset [, default]])` returns the value of `col` from `offset` rows before the current row in the ORDER BY. `LEAD` does the same looking ahead. Both default to offset=1 and `NULL` when no prior/next row exists.
+
+```sql
+-- Previous row's salary (NULL for the first row)
+SELECT id, salary, LAG(salary) OVER(ORDER BY id) AS prev_salary FROM employees
+
+-- Two rows ahead; substitute 0 if no row exists
+SELECT id, salary, LEAD(salary, 2, 0) OVER(ORDER BY id) AS next2 FROM employees
+
+-- Per-department previous salary (partition resets the offset)
+SELECT id, dept, salary,
+       LAG(salary) OVER(PARTITION BY dept ORDER BY id) AS prev_dept_salary
+FROM employees
+```
+
+#### Value Functions — FIRST_VALUE / LAST_VALUE / NTH_VALUE
+
+These return the first, last, or nth value of a column within the window frame.
+
+```sql
+-- First salary in each department (by hire date)
+SELECT dept, name,
+       FIRST_VALUE(salary) OVER(PARTITION BY dept ORDER BY hire_date
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_sal
+FROM employees
+
+-- Last salary — requires explicit ROWS UNBOUNDED to see the whole partition
+SELECT dept, name,
+       LAST_VALUE(salary) OVER(PARTITION BY dept ORDER BY hire_date
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_sal
+FROM employees
+
+-- Second value in partition order
+SELECT dept, name,
+       NTH_VALUE(salary, 2) OVER(PARTITION BY dept ORDER BY hire_date
+                                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second_sal
+FROM employees
+```
+
+`LAST_VALUE` and `NTH_VALUE` typically need `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` because the default running frame only sees rows up to (and including peers of) the current row.
+
+#### NTILE
+
+`NTILE(n)` divides the ordered partition into `n` buckets as evenly as possible. The first `(partition_size % n)` buckets receive one extra row.
+
+```sql
+SELECT id, salary, NTILE(4) OVER(ORDER BY salary DESC) AS quartile FROM employees
+```
+
+#### CUME_DIST / PERCENT_RANK
+
+```sql
+-- Cumulative distribution: (last peer position + 1) / partition size
+SELECT id, score, CUME_DIST() OVER(ORDER BY score DESC) AS cd FROM results
+
+-- Percent rank: (rank − 1) / (partition size − 1); first row is always 0.0
+SELECT id, score, PERCENT_RANK() OVER(ORDER BY score DESC) AS pr FROM results
 ```
 
 ### CTEs (Common Table Expressions)
@@ -619,6 +796,61 @@ FROM users
 
 The inner `WHERE` receives the outer row's columns as a fallback, so `users.id` in the subquery resolves from the driving row automatically.
 
+### IN (subquery) / NOT IN (subquery)
+
+```sql
+-- Uncorrelated: users in northern regions
+SELECT name FROM users
+WHERE region_id IN (SELECT id FROM regions WHERE name LIKE 'North%')
+
+-- NOT IN variant
+SELECT name FROM users
+WHERE region_id NOT IN (SELECT id FROM regions WHERE name LIKE 'North%')
+
+-- Correlated: users who have at least one open order
+SELECT name FROM users
+WHERE id IN (SELECT user_id FROM orders WHERE orders.status = 'open')
+
+-- As a projected column
+SELECT name,
+       region_id IN (SELECT id FROM regions WHERE name LIKE 'North%') AS in_north
+FROM users
+```
+
+The subquery must `SELECT` exactly one column. The inner `WHERE` receives the outer row as correlation context, so `outer.col` references resolve automatically — same mechanism as `EXISTS`. An empty subquery makes `IN` always false and `NOT IN` always true.
+
+### Scalar subqueries
+
+A subquery that returns one column and at most one row can appear **anywhere a value expression is expected**: in `SELECT`, `WHERE`, `HAVING`, and as a comparison operand.
+
+```sql
+-- Projected column: order count per user (correlated)
+SELECT name,
+       (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) AS order_count
+FROM users
+
+-- WHERE comparison against an aggregate
+SELECT name FROM users
+WHERE (SELECT SUM(amount) FROM orders WHERE orders.user_id = users.id)
+    > (SELECT AVG(amount) FROM orders)
+
+-- RHS of = : find the row matching the maximum id
+SELECT name FROM users WHERE id = (SELECT MAX(id) FROM users)
+
+-- Correlated lookup: fetch a related column from another table
+SELECT name, (SELECT depts.name FROM depts WHERE depts.id = users.dept_id) AS dept
+FROM users
+
+-- ORDER BY + LIMIT inside the subquery
+SELECT (SELECT amount FROM orders WHERE user_id = 1 ORDER BY amount ASC LIMIT 1) AS cheapest
+```
+
+Rules and limits:
+- The subquery must `SELECT` exactly **one column** (not `*`).
+- **0 rows** → `NULL`; **1 row** → its value; **2+ rows** → error.
+- Correlation works the same as `EXISTS`: the outer driving row is merged as a fallback so bare references resolve to the inner table and qualified references like `users.id` resolve to the outer row.
+- The full SELECT pipeline is supported inside the subquery: `WHERE`, `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`.
+
 ### = ANY(…) / <> ALL(…)
 
 PostgreSQL-style set operators are rewritten to `IN` / `NOT IN` before parsing, so the MySQL-dialect parser handles them transparently.
@@ -697,6 +929,16 @@ db.Exec(`
 
 `EXCLUDED.col` refers to the value that was in the incoming row for that column, matching PostgreSQL semantics.
 
+Use `db.Query` with `RETURNING` to read the row after insert or update in one round trip:
+
+```go
+rows, err := db.Query(`
+    INSERT INTO counters (id, v) VALUES (1, 10)
+    ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v
+    RETURNING id, v`)
+// rows[0] holds the new values for id=1
+```
+
 ## Use Cases
 
 **Microservice with lightweight local state**
@@ -745,15 +987,114 @@ Sketch out a data model and queries before committing to a real database schema.
 - No transactions or rollback
 - No indexes. All queries do a full table scan.
 - No foreign key constraints. Model relations with JOINs.
-- MySQL SQL dialect (via `github.com/xwb1989/sqlparser`)
+- MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression.
 
 ## Roadmap
+
+### Next: `database/sql` driver + transactions
+
+The most impactful near-term step is making vapordb a drop-in `database/sql` backend so it can be used with **sqlx**, **bun**, **goqu**, and any other library that accepts a `*sql.DB`.
+
+Everything sqlx relies on for struct mapping is already in place — `db:` tags, embedded structs, named parameters, `driver.Valuer` / `sql.Scanner`, `fmt.Stringer` / pointer fields. The remaining work is two tightly coupled pieces:
+
+**1. `database/sql/driver` implementation** (`driver.go`)
+
+Five small interfaces wrap the existing engine:
+
+| Interface | Key method(s) |
+|-----------|--------------|
+| `driver.Driver` | `Open(name string) (driver.Conn, error)` |
+| `driver.Conn` | `Prepare(query string) (driver.Stmt, error)`, `Begin() (driver.Tx, error)` |
+| `driver.Stmt` | `NumInput() int`, `Exec(args)`, `Query(args)` |
+| `driver.Rows` | `Columns() []string`, `Next(dest []driver.Value) error` |
+| `driver.Tx` | `Commit() error`, `Rollback() error` |
+
+Registration via `sql.Register("vapordb", &Driver{})` lets callers use the standard interface:
+
+```go
+import _ "github.com/flyingraptor/vapordb/driver"
+
+db, _ := sql.Open("vapordb", "")
+sqlxDB := sqlx.NewDb(db, "vapordb")
+
+sqlxDB.NamedExecContext(ctx, `INSERT INTO users (id, name) VALUES (:id, :name)`, user)
+sqlxDB.SelectContext(ctx, &users, `SELECT * FROM users ORDER BY name`)
+```
+
+**2. Transactions** (`BEGIN` / `COMMIT` / `ROLLBACK`)
+
+Required by `driver.Conn.Begin()`. Implementation: snapshot the affected tables' row slices on `Begin`; restore on `Rollback`; discard the snapshot on `Commit`. Full MVCC is not needed — a shallow copy-on-write approach per transaction is sufficient for test use.
+
+```go
+tx, err := db.Begin()
+tx.Exec(`INSERT INTO orders (id, amount) VALUES (1, 99.00)`)
+tx.Exec(`UPDATE accounts SET balance = balance - 99.00 WHERE id = 1`)
+tx.Commit()   // or tx.Rollback()
+```
+
+**Positional parameters** (`$1`, `$2` for Postgres; `?` for MySQL/SQLite) will be rewritten to vapordb's existing `:name` form as part of the driver pre-processing layer.
+
+---
 
 - **Migration script generation.** `db.GenerateDDL(dialect)` inspects the live schema and emits a `CREATE TABLE` script (and `DeclareEnum` calls for enum-constrained columns) that captures everything vapordb has inferred. Supported dialects: `"mysql"` and `"postgres"`. The output is ready to paste into a real database, closing the loop from rapid prototyping to production schema.
 
 - **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`. Note: full JSON query languages such as PostgreSQL's `jsonpath` (`@@`, `@?`) or MySQL's `JSON_TABLE` are out of scope — only the basic operators listed above will be supported.
 
 ## Changelog
+
+### 2026-05-11 (fifth)
+
+**Added**
+
+- **`FULL OUTER JOIN` / `FULL JOIN`** — returns all rows from both sides; matched rows appear once with both sides populated; unmatched left rows get `NULL` right columns; unmatched right rows get `NULL` left columns. Works with `PARTITION BY`, `WHERE`, `GROUP BY`, `ORDER BY`, CTEs, and chains of multiple joins. The MySQL-dialect parser has no FULL OUTER JOIN grammar, so `FULL [OUTER] JOIN` is rewritten to a `STRAIGHT_JOIN` sentinel before parsing and mapped back internally.
+- **`RIGHT JOIN` / `RIGHT OUTER JOIN`** — previously parsed but semantically treated as INNER JOIN; now correctly returns all right rows with `NULL` left columns for unmatched right rows.
+
+**Fixed**
+
+- **Qualified column resolution in outer joins** — `resolveColumn` no longer allows the suffix fallback search to match a column from a *different* table when the reference has an explicit table qualifier (e.g. `l.id` no longer resolves to `r.id` when the left table is empty). Qualified references now resolve to `NULL` when the target table's columns are absent from the row (as expected for the null-padded side of an outer join).
+
+### 2026-05-11 (fourth)
+
+**Added**
+
+- **Window frames** — `ROWS BETWEEN … AND …` and `RANGE BETWEEN … AND …` frame clauses are now parsed and applied to aggregate and value window functions. Supported bounds: `UNBOUNDED PRECEDING`, `N PRECEDING`, `CURRENT ROW`, `N FOLLOWING`, `UNBOUNDED FOLLOWING`. RANGE supports `UNBOUNDED PRECEDING`, `CURRENT ROW`, and `UNBOUNDED FOLLOWING` (peer-group aware); RANGE with `N PRECEDING` / `N FOLLOWING` is not yet supported.
+- **Default frame rule** — when ORDER BY is present inside `OVER(…)` but no frame is written, aggregate and value window functions now use the SQL standard default of `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (running aggregate with peer-group handling). Without ORDER BY the default remains the whole partition (`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`).
+- **`LAG(col [, offset [, default]])`** / **`LEAD(col [, offset [, default]])`** — offset lookup in the sorted partition. Offset defaults to 1; the optional third argument is the value returned when no previous/next row exists (defaults to `NULL`). Work with `PARTITION BY`.
+- **`FIRST_VALUE(col)`** / **`LAST_VALUE(col)`** / **`NTH_VALUE(col, n)`** — frame-based value functions. The frame bounds (defaulting to the running frame) determine which rows are considered.
+- **`NTILE(n)`** — distributes the ordered partition into `n` as-equal-as-possible buckets; returns the 1-based bucket number for each row.
+- **`CUME_DIST()`** — cumulative distribution: `(last_peer_position + 1) / partition_size`; tied rows share the same value.
+- **`PERCENT_RANK()`** — percent rank: `(rank − 1) / (partition_size − 1)`; first row in ordering is always `0.0`.
+
+### 2026-05-11 (third)
+
+**Added**
+
+- **Scalar subqueries** — a `(SELECT col FROM …)` expression can appear anywhere a value expression is expected: projected columns, `WHERE` / `HAVING` operands, the RHS of comparisons, and `ORDER BY`. The inner SELECT must project exactly one column. Zero rows → `NULL`; one row → its value; two or more rows → error. The full inner SELECT pipeline is supported (aggregates, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`). Correlated references to the outer row (e.g. `orders.user_id = users.id`) work via the same outer-row merge mechanism used by `EXISTS` and `IN (subquery)`.
+- **Correlation fix** — the correlated merge now correctly qualifies inner table columns so that bare unqualified references (e.g. `name`) resolve to the inner table, while outer-table–qualified references (e.g. `users.id`) resolve to the outer row even when both tables share a column name like `id`. This also makes `IN (subquery)` and `EXISTS` count-correct in those cases.
+
+### 2026-05-11 (second)
+
+**Added**
+
+- **`IN (subquery)` / `NOT IN (subquery)`** — correlated and uncorrelated subqueries on the RHS of `IN` / `NOT IN`. The inner SELECT must project exactly one column. The inner `WHERE` receives the outer row as correlation context, so `orders.user_id = users.id`-style references work without any extra syntax. An empty subquery makes `IN` always false and `NOT IN` always true. Usable in `WHERE`, `HAVING`, and as a projected boolean expression. `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, and `UNION` inside the subquery return a clear unsupported error for now.
+
+### 2026-05-11
+
+**Added / changed**
+
+- **`LIKE … ESCAPE`** — literal `%` and `_` in patterns; `ESCAPE ''` matches plain `LIKE` wildcard rules; invalid multi-character escape literals return an error from expression evaluation.
+- **`||` operator** — PostgreSQL-style: concatenate when either operand is a string, otherwise boolean OR (matches how `||` is represented in this parser). Parenthesize when mixing with `LIKE` (see SQL reference).
+- **`RETURNING` on upsert** — `INSERT … ON CONFLICT … RETURNING` returns one row per `VALUES` tuple (inserted or updated); `DO NOTHING` skips do not appear.
+- **Named parameters** — `QueryNamed` / `ExecNamed` accept `time.Time`, `driver.Valuer`, `encoding.TextMarshaler`, and `fmt.Stringer` values in maps and structs (for example `net.IP`, `uuid.UUID`).
+- **`CAST` / `CONVERT`** — typed coercions for common SQL targets (with MySQL-oriented type names where the parser requires them).
+- **Schema conflict policy** — unsafe column type changes error by default instead of wiping the table; opt in with `New(WithForceWipeOnSchemaConflict(true))` or per-call `WithWriteForceWipeOnSchemaConflict`.
+- **Embedded structs** — `ScanRows`, `InsertStruct`, and named-parameter structs recurse anonymous embedded fields with `db` tags (exported embed type names only).
+
+**Fixed**
+
+- **Window + `LIMIT`** — outer `LIMIT` / `OFFSET` apply after window evaluation so `COUNT(*) OVER()` reflects the full filtered set.
+- **Correlated `EXISTS`** — single-table `FROM` with an explicit alias qualifies outer columns so inner `id` does not shadow `alias.id`.
+- **`INSERT … RETURNING`** after a schema wipe returns the correct rows.
 
 ### 2026-04-27 (fourth)
 
@@ -784,7 +1125,7 @@ Sketch out a data model and queries before committing to a real database schema.
 **Added**
 
 - **`RETURNING` clause.** Append `RETURNING col1, col2` or `RETURNING *` to any `INSERT`, `UPDATE`, or `DELETE` and call `db.Query(…)` to receive the affected rows. INSERT returns the newly inserted rows; UPDATE returns the rows in their post-update state; DELETE returns the rows in their pre-deletion state. Specific columns with optional `AS alias` are supported, as are named parameters (`QueryNamed`). Implemented as a pre-processor that strips the clause before handing the DML to the parser.
-- **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, and `MAX(col)` with `OVER([PARTITION BY …] [ORDER BY …])`. Implemented via pre-processing: window expressions are extracted before the SQL parser sees the query, executed as placeholder columns, and replaced with computed values on the result rows. Aggregate window functions (`SUM`, `AVG`, `MIN`, `MAX`, `COUNT`) return the same value for every row in the partition. Ranking functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`) return per-row positions according to the OVER ORDER BY. Columns referenced in `PARTITION BY`, `ORDER BY`, and the function argument do not need to be present in the outer `SELECT` list. Window functions compose with `WHERE`, `GROUP BY`, `HAVING`, `JOIN`, `UNION`, and CTEs.
+- **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT(*)`, `SUM(col)`, `AVG(col)`, `MIN(col)`, and `MAX(col)` with `OVER([PARTITION BY …] [ORDER BY …])`. Implemented via pre-processing: window expressions are extracted before the SQL parser sees the query, executed as placeholder columns, and replaced with computed values on the result rows. Ranking functions return per-row positions according to the OVER ORDER BY. Aggregate window functions return the whole-partition value (frame support and additional value functions added in 2026-05-11 fourth). Columns referenced in `PARTITION BY`, `ORDER BY`, and the function argument do not need to be present in the outer `SELECT` list. Window functions compose with `WHERE`, `GROUP BY`, `HAVING`, `JOIN`, `UNION`, and CTEs.
 
 ### 2026-04-25
 
@@ -817,7 +1158,7 @@ Sketch out a data model and queries before committing to a real database schema.
 ### Initial release
 
 - In-memory SQL engine with automatic schema inference and safe type widening.
-- `SELECT` with `WHERE`, `JOIN` (INNER, LEFT), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`.
+- `SELECT` with `WHERE`, `JOIN` (INNER, LEFT, RIGHT, FULL OUTER), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`.
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` (including `COUNT(DISTINCT …)`).
 - Predicates: `=`, `<>`, `<`, `>`, `<=`, `>=`, `BETWEEN`, `IN`, `NOT IN`, `LIKE`, `NOT LIKE`, `IS NULL`, `IS NOT NULL`, `IS TRUE`, `IS FALSE`, `AND`, `OR`, `NOT`.
 - Scalar functions: `UPPER`, `LOWER`, `LENGTH`, `CHAR_LENGTH`, `CONCAT`, `COALESCE`, `IFNULL`, `NULLIF`, `ABS`, `ROUND`, `FLOOR`, `CEIL`, `CAST`.

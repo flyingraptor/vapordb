@@ -115,35 +115,47 @@ func projectReturning(rows []Row, retCols string) ([]Row, error) {
 	return result, nil
 }
 
+func copyRowSlice(rows []Row) []Row {
+	result := make([]Row, len(rows))
+	for i, r := range rows {
+		cp := make(Row, len(r))
+		for k, v := range r {
+			cp[k] = v
+		}
+		result[i] = cp
+	}
+	return result
+}
+
 // ── DML-with-RETURNING helpers ────────────────────────────────────────────────
 
-// execInsertReturning runs an INSERT and returns the rows that were inserted
-// (appended to the table). For ON CONFLICT DO NOTHING, silently-skipped rows
-// are not returned. For ON CONFLICT DO UPDATE the upserted row is not returned
-// in this release; only newly appended rows are.
-func execInsertReturning(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool) ([]Row, error) {
+// execInsertReturning runs an INSERT and returns rows for RETURNING: one row
+// per VALUES tuple that was inserted or updated by upsert (DO UPDATE), in
+// order. DO NOTHING skips do not appear. If a schema conflict wipe occurred,
+// all rows currently in the table are returned.
+func execInsertReturning(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool) ([]Row, error) {
 	tblName := stmt.Table.Name.String()
 
-	// Record the current table length so we can find the newly appended rows.
-	tbl := db.Tables[tblName]
-	prevLen := 0
-	if tbl != nil {
-		prevLen = len(tbl.Rows)
-	}
-
-	if err := execInsert(db, stmt, conflictCols, doNothing); err != nil {
+	var affectedIdx []int
+	var schemaWiped bool
+	if err := execInsert(db, stmt, conflictCols, doNothing, forceWipeOnSchemaConflict, &schemaWiped, &affectedIdx); err != nil {
 		return nil, err
 	}
 
-	tbl = db.Tables[tblName]
-	if tbl == nil || len(tbl.Rows) <= prevLen {
+	tbl := db.Tables[tblName]
+	if tbl == nil || len(tbl.Rows) == 0 {
+		return nil, nil
+	}
+	if schemaWiped {
+		return copyRowSlice(tbl.Rows), nil
+	}
+	if len(affectedIdx) == 0 {
 		return nil, nil
 	}
 
-	// Copy the slice so callers get a stable snapshot.
-	newRows := tbl.Rows[prevLen:]
-	result := make([]Row, len(newRows))
-	for i, r := range newRows {
+	result := make([]Row, len(affectedIdx))
+	for i, idx := range affectedIdx {
+		r := tbl.Rows[idx]
 		cp := make(Row, len(r))
 		for k, v := range r {
 			cp[k] = v
@@ -266,7 +278,7 @@ func execDeleteReturning(db *DB, stmt *sqlparser.Delete) ([]Row, error) {
 
 // execDMLReturning parses a DML statement (INSERT / UPDATE / DELETE), executes
 // it, and returns the affected rows projected through the RETURNING column list.
-func execDMLReturning(db *DB, sql string, retCols string) ([]Row, error) {
+func execDMLReturning(db *DB, sql string, retCols string, forceWipeOnSchemaConflict bool) ([]Row, error) {
 	rewritten, conflictCols, doNothing := rewriteOnConflict(rewriteAnyAll(sql))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
@@ -276,7 +288,7 @@ func execDMLReturning(db *DB, sql string, retCols string) ([]Row, error) {
 	var rows []Row
 	switch s := stmt.(type) {
 	case *sqlparser.Insert:
-		rows, err = execInsertReturning(db, s, conflictCols, doNothing)
+		rows, err = execInsertReturning(db, s, conflictCols, doNothing, forceWipeOnSchemaConflict)
 	case *sqlparser.Update:
 		rows, err = execUpdateReturning(db, s)
 	case *sqlparser.Delete:

@@ -152,6 +152,51 @@ func TestIPRoundTrip(t *testing.T) {
 	}
 }
 
+// ── embedded anonymous structs (ScanRows) ────────────────────────────────────
+
+type RegionCore struct {
+	ID   int64  `db:"id"`
+	Name string `db:"name"`
+}
+
+type regionWithStat struct {
+	RegionCore
+	TotalCount int `db:"total_count"`
+}
+
+func TestScanRowsEmbeddedAnonymousStruct(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO regions (id, name) VALUES (10, 'North')`)
+	rows := mustQuery(t, db, `SELECT id, name, 42 AS total_count FROM regions WHERE id = 10`)
+	out := ScanRows[regionWithStat](rows)
+	if len(out) != 1 {
+		t.Fatalf("want 1 row, got %d", len(out))
+	}
+	if out[0].ID != 10 || out[0].Name != "North" || out[0].TotalCount != 42 {
+		t.Fatalf("embedded scan: got %+v", out[0])
+	}
+}
+
+type EmbedPtrBase struct {
+	N int `db:"n"`
+}
+
+type rowWithPtrEmbed struct {
+	*EmbedPtrBase
+	K string `db:"k"`
+}
+
+func TestScanRowsEmbeddedPointerStructAllocates(t *testing.T) {
+	rows := []Row{{"n": intVal(7), "k": strVal("hi")}}
+	out := ScanRows[rowWithPtrEmbed](rows)
+	if out[0].EmbedPtrBase == nil || out[0].N != 7 {
+		t.Fatalf("nil *embed should allocate: got %+v", out[0])
+	}
+	if out[0].K != "hi" {
+		t.Fatalf("K: %q", out[0].K)
+	}
+}
+
 // ── nil Stringer pointer ──────────────────────────────────────────────────────
 
 type WithIPPtr struct {

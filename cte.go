@@ -117,14 +117,17 @@ func parseCTEs(sql string) (ctes []cteRef, mainQuery string, ok bool) {
 // and returns the augmented DB together with the main query string.
 //
 // If no WITH clause is present the original db and sql are returned unchanged.
-func resolveCTEs(db *DB, sql string) (*DB, string, error) {
+func resolveCTEs(db *DB, sql string, forceWipeOnSchemaConflict bool) (*DB, string, error) {
 	ctes, mainQuery, hasCTE := parseCTEs(sql)
 	if !hasCTE {
 		return db, sql, nil
 	}
 
 	// Shallow copy: real tables are shared (read-only during CTE execution).
-	tempDB := &DB{Tables: make(map[string]*Table, len(db.Tables)+len(ctes))}
+	tempDB := &DB{
+		Tables:                    make(map[string]*Table, len(db.Tables)+len(ctes)),
+		forceWipeOnSchemaConflict: forceWipeOnSchemaConflict,
+	}
 	for k, v := range db.Tables {
 		tempDB.Tables[k] = v
 	}
