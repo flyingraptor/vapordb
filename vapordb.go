@@ -15,6 +15,30 @@ import (
 	"github.com/xwb1989/sqlparser"
 )
 
+// jsonArrowTextRE rewrites col->>'$.path' → json_unquote(json_extract(col, '$.path'))
+// Must be processed before jsonArrowRE to avoid a partial ->> match.
+var jsonArrowTextRE = regexp.MustCompile(`(?i)(\w+)\s*->>\s*('[^']*')`)
+
+// jsonArrowRE rewrites col->'$.path' → json_extract(col, '$.path')
+var jsonArrowRE = regexp.MustCompile(`(?i)(\w+)\s*->\s*('[^']*')`)
+
+// jsonContainsAtRE rewrites col @> expr → json_contains(col, expr)
+var jsonContainsAtRE = regexp.MustCompile(`(?i)(\w+)\s*@>\s*(\w+|'[^']*')`)
+
+// jsonContainedInRE rewrites col <@ expr → json_contains(expr, col)
+var jsonContainedInRE = regexp.MustCompile(`(?i)(\w+)\s*<@\s*(\w+|'[^']*')`)
+
+// rewriteJSONOps rewrites PostgreSQL/MySQL JSON shorthand operators into
+// equivalent json_extract / json_contains function calls that the MySQL-dialect
+// parser understands.
+func rewriteJSONOps(sql string) string {
+	sql = jsonArrowTextRE.ReplaceAllString(sql, "json_unquote(json_extract($1, $2))")
+	sql = jsonArrowRE.ReplaceAllString(sql, "json_extract($1, $2)")
+	sql = jsonContainsAtRE.ReplaceAllString(sql, "json_contains($1, $2)")
+	sql = jsonContainedInRE.ReplaceAllString(sql, "json_contains($2, $1)")
+	return sql
+}
+
 // fullOuterRE matches FULL [OUTER] JOIN (case-insensitive) at word boundaries.
 var fullOuterRE = regexp.MustCompile(`(?i)\bFULL\s+(?:OUTER\s+)?JOIN\b`)
 
@@ -221,7 +245,7 @@ func (db *DB) Query(sql string, opts ...WriteOption) (rows []Row, retErr error) 
 		return execDMLReturning(target, dmlSQL, retCols, forceWipe)
 	}
 
-	mainSQL = rewriteFullOuterJoins(mainSQL)
+	mainSQL = rewriteFullOuterJoins(rewriteFilterAggregates(rewriteJSONOps(mainSQL)))
 	mainSQL, winSpecs, err := extractWindowFuncs(mainSQL)
 	if err != nil {
 		return nil, err
@@ -307,14 +331,14 @@ func (db *DB) Exec(sql string, opts ...WriteOption) (retErr error) {
 	}
 	db = target
 	sql = mainSQL
-	rewritten, conflictCols, doNothing := rewriteOnConflict(rewriteAnyAll(sql))
+	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(sql))))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
 	}
 	switch s := stmt.(type) {
 	case *sqlparser.Insert:
-		return execInsert(db, s, conflictCols, doNothing, forceWipe, nil, nil)
+		return execInsert(db, s, conflictCols, doNothing, forceWipe, nil, nil, upsertWhere)
 	case *sqlparser.Update:
 		return execUpdate(db, s)
 	case *sqlparser.Delete:

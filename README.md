@@ -37,6 +37,10 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Schema locking.** `db.LockTable(name)` / `db.LockSchema()` freeze a table's schema. Any INSERT that would add a new column, widen a type, or trigger an unsafe type change is rejected with an error. `db.UnlockTable` / `db.UnlockSchema` re-enable evolution. Lock state persists through `Save` / `Load`.
 - **Query log.** After the first `db.Save("db.json")` or `db.Load("db.json")`, every `Exec` and `Query` call is automatically appended to a companion `db_queries.jsonl` file (JSON Lines). Each entry records the timestamp, operation, SQL, duration in ms, row count, and any error. Zero setup — the log starts automatically alongside the snapshot.
 - **Optional persistence.** Save the entire database to a JSON file and reload it later.
+- **Transactions.** `db.Begin()` returns a `*Tx` with the same `Exec` / `Query` API. `tx.Commit()` makes all changes permanent; `tx.Rollback()` restores the database to the state it was in when `Begin` was called (copy-on-write snapshot per table).
+- **`database/sql` driver.** Import `_ "github.com/flyingraptor/vapordb/driver"` and call `driver.Register(name, db)` to expose any `*DB` as a standard `*sql.DB`. Works with sqlx, bun, goqu, and any library that speaks `database/sql`. Positional `?` and `$N` parameter styles are supported.
+- **DDL generation.** `db.GenerateDDL("mysql")` / `db.GenerateDDL("postgres")` emits `CREATE TABLE` DDL for the live schema, ready to paste into a real database.
+- **JSON type.** `KindJSON` stores JSON documents (`map[string]any`, `[]any`). Use `json_parse('…')`, `CAST(x AS JSON)`, or Go map/slice struct fields. Supports `json_extract`, `json_unquote`, `json_contains`, arrow operators (`->`, `->>`), and containment operators (`@>`, `<@`). JSON values survive `Save` / `Load`.
 
 ## Installation
 
@@ -889,6 +893,73 @@ rows, _ = db.QueryNamed(`SELECT * FROM users WHERE id = ANY(:ids)`, Filter{IDs: 
 
 An empty slice expands to `IN (NULL)`, which matches no rows — a safe no-op.
 
+#### `pq.Array` and plain Go slices via `database/sql`
+
+When using the `database/sql` driver, the same expansion happens automatically for:
+
+- **`pq.Array([]T{…})`** (from `github.com/lib/pq`) — `pq.Array(slice).Value()` returns a PostgreSQL array literal like `"{A001,A002}"`, which the driver detects and expands.
+- **Plain Go slices** — `[]string{…}`, `[]int64{…}`, etc. are intercepted by `driver.NamedValueChecker` before `database/sql` rejects them, converted to the same `{…}` format, then expanded.
+
+```go
+// Both of these work:
+sqlDB.QueryContext(ctx,
+    `SELECT * FROM accounts WHERE code = ANY($1)`,
+    pq.Array([]string{"A001", "A002"}),  // pq.Array style
+)
+sqlDB.QueryContext(ctx,
+    `SELECT * FROM accounts WHERE code = ANY($1)`,
+    []string{"A001", "A002"},            // plain slice — also works
+)
+```
+
+### sqlx integration
+
+vapordb's `database/sql` driver is fully compatible with [sqlx](https://github.com/jmoiron/sqlx). The driver reports its name as `"vapordb"`, which sqlx maps to `?` (QUESTION) bind style. Because vapordb natively handles **both** `?` and `$N` placeholders, most code written for either style works without any changes.
+
+**Option A — no configuration needed** (works for most code):
+
+```go
+import (
+    vapordriver "github.com/flyingraptor/vapordb/driver"
+    "github.com/jmoiron/sqlx"
+)
+
+vapordriver.Register("testdb", vdb)
+db := sqlx.MustOpen("vapordb", "testdb")
+
+// ? style works:
+db.MustExec(`INSERT INTO t (id, v) VALUES (?, ?)`, 1, "hello")
+// $N style also works directly (vapordb supports both):
+db.MustExec(`INSERT INTO t (id, v) VALUES ($1, $2)`, 2, "world")
+// :name style works via sqlx.NamedExec:
+db.NamedExec(`INSERT INTO t (id, v) VALUES (:id, :v)`, map[string]any{"id": 3, "v": "!"})
+```
+
+**Option B — `sqlx.NewDb` for explicit PostgreSQL bind style** (recommended when migrating from Postgres):
+
+```go
+sqlDB, _ := sql.Open("vapordb", "testdb")
+db := sqlx.NewDb(sqlDB, "postgres")  // tell sqlx to use $N placeholders
+
+// Now db.Rebind outputs $N style, and NamedExec generates $N internally:
+db.MustExec(`INSERT INTO t (id, v) VALUES ($1, $2)`, 1, "hello")
+db.Rebind(`SELECT * FROM t WHERE id = ?`)  // → "SELECT * FROM t WHERE id = $1"
+```
+
+**Option C — `RegisterAs` for automatic detection**:
+
+If you need `sqlx.Open` / `sqlx.MustOpen` to auto-detect the bind style, register the driver under a name that sqlx recognises:
+
+```go
+// In TestMain or init — call once.
+vapordriver.RegisterAs("pgx")  // sqlx treats "pgx" as $N (DOLLAR) style
+
+vapordriver.Register("testdb", vdb)
+db := sqlx.MustOpen("pgx", "testdb")  // DriverName() == "pgx" → DOLLAR bind style
+```
+
+`RegisterAs` is idempotent and safe to call multiple times. If `"pgx"` (or whatever name you choose) is already claimed by another driver in the same binary, the call is silently ignored.
+
 ### UPSERT
 
 PostgreSQL-style `ON CONFLICT` is fully supported. Conflict detection is done by value-equality on the specified column(s); no unique index is required.
@@ -984,63 +1055,120 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ## Limitations
 
-- No transactions or rollback
 - No indexes. All queries do a full table scan.
 - No foreign key constraints. Model relations with JOINs.
 - MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression.
 
 ## Roadmap
 
-### Next: `database/sql` driver + transactions
+### Completed
 
-The most impactful near-term step is making vapordb a drop-in `database/sql` backend so it can be used with **sqlx**, **bun**, **goqu**, and any other library that accepts a `*sql.DB`.
+- Named parameters (`db.QueryNamed` / `db.ExecNamed`) ✓
+- `fmt.Stringer` / pointer support in struct mapping ✓
+- `driver.Valuer` / `sql.Scanner` support ✓
+- `ON CONFLICT … DO UPDATE SET` (UPSERT) ✓
+- `= ANY(…)` / `<> ALL(…)` array operators ✓
+- `SELECT EXISTS (subquery)` ✓
+- Subqueries in FROM, UNION / UNION ALL, CTEs ✓
+- Window functions with ROWS / RANGE frames, LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE / NTILE / CUME_DIST / PERCENT_RANK ✓
+- `FULL OUTER JOIN` / `RIGHT JOIN` ✓
+- `IN (subquery)` / `NOT IN (subquery)` — correlated and uncorrelated ✓
+- Scalar subqueries — `(SELECT col FROM …)` anywhere a value is expected ✓
+- **Transactions** — `db.Begin()` / `tx.Commit()` / `tx.Rollback()` ✓
+- **`database/sql` driver** — `github.com/flyingraptor/vapordb/driver` ✓
+- **`GenerateDDL(dialect)`** — emit `CREATE TABLE` DDL for MySQL or Postgres ✓
+- **`KindJSON`** — first-class JSON type with `json_extract`, `json_unquote`, `json_contains`, `->`, `->>`, `@>`, `<@` ✓
+- **`FILTER (WHERE …)` on aggregates** — PostgreSQL-style conditional aggregation ✓
+- **`array_agg(col)`** — collect values into a JSON array ✓
+- **Partial `ON CONFLICT` target** — `ON CONFLICT (cols) WHERE predicate DO UPDATE SET …` ✓
+- **Optimistic locking on upsert** — `ON CONFLICT … DO UPDATE SET … WHERE condition` ✓
+- **`pq.Array` / plain-slice parameter binding** — expanded to `IN (…)` literals in both native and `database/sql` driver paths ✓
+- **`driver.RegisterAs`** — alias the driver under any SQL driver name for sqlx bind-style auto-detection ✓
 
-Everything sqlx relies on for struct mapping is already in place — `db:` tags, embedded structs, named parameters, `driver.Valuer` / `sql.Scanner`, `fmt.Stringer` / pointer fields. The remaining work is two tightly coupled pieces:
+- **Persistence round-trip verified** — `Save` / `Load` confirmed correct for every `Kind` (Null, Bool, Int, Float, String, Date, JSON), `EnumSets`, and `Locked` flag. See `persist_test.go`. ✓
+- **`DATETIME(expr)` / `TIMESTAMP(expr)` function** — preserves the full time-of-day component when parsing or casting a value to a datetime (complements the existing `DATE(expr)` which truncates to midnight) ✓
+- **`time.Time` named-parameter fix** — `ExecNamed` / `ExecStruct` now emit `DATETIME('…')` for times with a non-zero time-of-day component; date-only values continue to use `DATE('…')` ✓
 
-**1. `database/sql/driver` implementation** (`driver.go`)
+- **`IN (subquery)` full pipeline** — `IN` / `NOT IN` subqueries now support the complete SELECT pipeline inside: `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, and `UNION` / `UNION ALL`. Correlated references to the outer row work in all of these. ✓
+- **Value-based `RANGE` frames** — `RANGE BETWEEN N PRECEDING AND N FOLLOWING` (and all mixed combinations with `UNBOUNDED`) compares the numeric ORDER BY column value of each row rather than row offsets. Works with `int64`, `float64`, and `DESC` ordering. ✓
+- **`HAVING` aggregates not in `SELECT`** — `HAVING COUNT(*) > 1` now works even when `COUNT(*)` does not appear in the `SELECT` list, for both the main pipeline and all subquery paths. ✓
 
-Five small interfaces wrap the existing engine:
+### Remaining
 
-| Interface | Key method(s) |
-|-----------|--------------|
-| `driver.Driver` | `Open(name string) (driver.Conn, error)` |
-| `driver.Conn` | `Prepare(query string) (driver.Stmt, error)`, `Begin() (driver.Tx, error)` |
-| `driver.Stmt` | `NumInput() int`, `Exec(args)`, `Query(args)` |
-| `driver.Rows` | `Columns() []string`, `Next(dest []driver.Value) error` |
-| `driver.Tx` | `Commit() error`, `Rollback() error` |
-
-Registration via `sql.Register("vapordb", &Driver{})` lets callers use the standard interface:
-
-```go
-import _ "github.com/flyingraptor/vapordb/driver"
-
-db, _ := sql.Open("vapordb", "")
-sqlxDB := sqlx.NewDb(db, "vapordb")
-
-sqlxDB.NamedExecContext(ctx, `INSERT INTO users (id, name) VALUES (:id, :name)`, user)
-sqlxDB.SelectContext(ctx, &users, `SELECT * FROM users ORDER BY name`)
-```
-
-**2. Transactions** (`BEGIN` / `COMMIT` / `ROLLBACK`)
-
-Required by `driver.Conn.Begin()`. Implementation: snapshot the affected tables' row slices on `Begin`; restore on `Rollback`; discard the snapshot on `Commit`. Full MVCC is not needed — a shallow copy-on-write approach per transaction is sufficient for test use.
-
-```go
-tx, err := db.Begin()
-tx.Exec(`INSERT INTO orders (id, amount) VALUES (1, 99.00)`)
-tx.Exec(`UPDATE accounts SET balance = balance - 99.00 WHERE id = 1`)
-tx.Commit()   // or tx.Rollback()
-```
-
-**Positional parameters** (`$1`, `$2` for Postgres; `?` for MySQL/SQLite) will be rewritten to vapordb's existing `:name` form as part of the driver pre-processing layer.
-
----
-
-- **Migration script generation.** `db.GenerateDDL(dialect)` inspects the live schema and emits a `CREATE TABLE` script (and `DeclareEnum` calls for enum-constrained columns) that captures everything vapordb has inferred. Supported dialects: `"mysql"` and `"postgres"`. The output is ready to paste into a real database, closing the loop from rapid prototyping to production schema.
-
-- **`JSON` / `JSONB` type support.** Store JSON documents as a first-class column kind (`KindJSON`). Accept both MySQL `JSON` and PostgreSQL `JSONB` column definitions. Support JSON path operators (`->`, `->>`) and containment checks (`@>`, `<@`) in WHERE and SELECT expressions. Values are kept as parsed `any` internally and serialise transparently through `Save` / `Load`. Note: full JSON query languages such as PostgreSQL's `jsonpath` (`@@`, `@?`) or MySQL's `JSON_TABLE` are out of scope — only the basic operators listed above will be supported.
+None — all roadmap items are complete.
 
 ## Changelog
+
+### 2026-05-12
+
+**Added**
+
+- **Value-based `RANGE` frames** — `RANGE BETWEEN N PRECEDING AND N FOLLOWING` (and all mixed combinations: `UNBOUNDED PRECEDING AND N FOLLOWING`, `N PRECEDING AND UNBOUNDED FOLLOWING`, `CURRENT ROW AND N FOLLOWING`, `N PRECEDING AND CURRENT ROW`) are now computed by comparing the numeric ORDER BY column value of each row against the current row's value ± N. Works with `int64` and `float64` ORDER BY columns; `DESC` ordering flips the direction correctly. All aggregate and value window functions benefit automatically.
+
+- **`IN (subquery)` full pipeline** — `IN` / `NOT IN` subqueries can now contain the complete SELECT pipeline: `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, and `UNION` / `UNION ALL`. Correlated references to the outer row work inside all of these. Previously only a bare `WHERE`-filtered `SELECT` was supported.
+
+- **`DATETIME(expr)` / `TIMESTAMP(expr)` function** — new scalar date function that parses a string or `KindDate` value into a full datetime, preserving the time-of-day component. Complements `DATE(expr)` which has always truncated to midnight.
+
+- **`FILTER (WHERE …)` on aggregates** — `SUM(amount) FILTER (WHERE type = 'RESERVED')` and all other standard aggregate functions now accept a PostgreSQL-style `FILTER` clause. Rewritten to `AGG(CASE WHEN cond THEN expr END)` before parsing, so it composes freely with `GROUP BY`, `HAVING`, `COALESCE`, and named parameters.
+
+- **`array_agg(col)`** — collects non-NULL column values into a `KindJSON` array. Returns `NULL` when all values are NULL. Works with `FILTER (WHERE …)` and `COALESCE(array_agg(…), '[]')`.
+
+- **Partial `ON CONFLICT` target** — `ON CONFLICT (cols) WHERE predicate DO UPDATE SET …` (partial-index conflict target). The `WHERE` predicate is stripped before execution since vapordb uses value-equality rather than real indexes; the update still applies when a conflict on the specified columns is found.
+
+- **Optimistic locking on upsert** — `ON CONFLICT (cols) DO UPDATE SET … WHERE condition` (trailing `WHERE` on the SET clause). The existing row is updated only when `condition` evaluates to true; otherwise the conflict is silently skipped (matching PostgreSQL semantics for `xmax` / version-column locking patterns).
+
+- **`pq.Array` parameter binding** — `pq.Array([]T{…}).Value()` returns a PostgreSQL array literal string (`"{A001,A002}"`). Both the native API (`QueryNamed` / `ExecNamed`) and the `database/sql` driver now detect this format and expand it to a SQL comma-separated literal list for use inside `IN (…)`. Plain Go slices (`[]string`, `[]int64`, etc.) are also accepted as positional arguments to `sql.DB.QueryContext` via a new `driver.NamedValueChecker` implementation that converts them to the same format before `database/sql` would reject them as unsupported types.
+
+- **`driver.RegisterAs(sqlDriverName string)`** — registers the vapordb SQL driver under an additional name so that sqlx (and other libraries that inspect the driver name) automatically selects the correct placeholder bind style. `RegisterAs("pgx")` makes sqlx use `$N` (DOLLAR) placeholders; `RegisterAs("mysql")` makes it use `?`. The call is idempotent and safe against duplicate-registration panics.
+
+- **`database/sql` driver** (`github.com/flyingraptor/vapordb/driver`) — import as a side-effect to register vapordb under the `"vapordb"` driver name. Call `driver.Register(name, db)` to associate a `*DB` with a DSN string, then use standard `sql.Open("vapordb", name)`. Compatible with sqlx, bun, goqu, and any library that accepts a `*sql.DB`. Both `?` (MySQL/SQLite-style) and `$1`/`$2` (Postgres-style) positional parameters are substituted as SQL literals before the query reaches the engine. Column order in result sets is alphabetical — predictable for ORMs that match by column name.
+
+  ```go
+  import _ "github.com/flyingraptor/vapordb/driver"
+
+  driver.Register("mydb", vdb)
+  sqlDB, _ := sql.Open("vapordb", "mydb")
+  sqlDB.Exec(`INSERT INTO users (id, name) VALUES (?, ?)`, 1, "Alice")
+  ```
+
+- **Transactions** (`db.Begin` / `tx.Commit` / `tx.Rollback`) — `db.Begin()` returns a `*Tx` with the full `Exec`, `Query`, `ExecNamed`, and `QueryNamed` API of `*DB`. A shallow copy-on-write snapshot of every table's row slice is captured at `Begin` time; `Rollback` atomically replaces the live tables with the snapshot, and `Commit` discards it. No MVCC — sufficient for fast in-process testing.
+
+  ```go
+  tx, _ := db.Begin()
+  tx.Exec(`UPDATE accounts SET balance = balance - 99 WHERE id = 1`)
+  tx.Exec(`INSERT INTO orders (id, amount) VALUES (42, 99)`)
+  tx.Commit()   // or tx.Rollback() to undo both changes
+  ```
+
+- **`GenerateDDL(dialect)`** — `db.GenerateDDL("mysql")` / `db.GenerateDDL("postgres")` inspects the live schema and emits `CREATE TABLE` DDL for every table, ready to paste into a real database. Type mapping: `KindBool` → `TINYINT(1)` / `BOOLEAN`; `KindInt` → `BIGINT`; `KindFloat` → `DOUBLE` / `DOUBLE PRECISION`; `KindDate` → `DATETIME` / `TIMESTAMP`; `KindJSON` → `JSON` / `JSONB`. Enum-constrained columns become `ENUM(…)` in MySQL and `TEXT … CHECK (… IN (…))` in Postgres. Tables and columns appear in alphabetical order for deterministic, diff-friendly output.
+
+- **`KindJSON` — first-class JSON type** — a new `KindJSON` value kind stores JSON documents as live Go values (`map[string]any` / `[]any`). JSON columns arise naturally from any of:
+  - `json_parse('{"k":"v"}')` literal in SQL
+  - `CAST(expr AS JSON)` / `CAST(expr AS JSONB)`
+  - Go `map[string]any` / `[]any` struct fields via `InsertStruct` or `ExecNamed`
+
+  JSON values round-trip through `Save` / `Load`. Supported SQL operations:
+
+  | Expression | Meaning |
+  |------------|---------|
+  | `json_extract(doc, '$.key')` | Extract value at path |
+  | `doc -> '$.key'` | Shorthand for `json_extract` |
+  | `json_unquote(val)` | Return JSON scalar as plain string |
+  | `doc ->> '$.key'` | Shorthand for `json_unquote(json_extract(…))` |
+  | `json_contains(doc, candidate)` | True when doc contains all key-value pairs of candidate |
+  | `doc @> expr` | PostgreSQL-style containment |
+  | `doc <@ expr` | PostgreSQL-style "contained in" |
+  | `json_array_length(arr)` | Number of elements in a JSON array |
+  | `json_keys(obj)` | Keys of a JSON object as a JSON array |
+  | `json_type(val)` | `'OBJECT'`, `'ARRAY'`, `'STRING'`, `'INTEGER'`, `'BOOLEAN'` |
+
+  `ScanRows[T]` maps `KindJSON` values into `map[string]any`, `[]any`, and `any` struct fields automatically.
+
+**Fixed**
+
+- **`HAVING` aggregates not in `SELECT`** — `SELECT dept_id … GROUP BY dept_id HAVING COUNT(*) > 1` now works correctly when `COUNT(*)` is not in the `SELECT` list. Previously the aggregate resolved to `NULL` inside the HAVING predicate because `collectGroupAggs` did not recurse into `ComparisonExpr`, `AndExpr`, `OrExpr`, `NotExpr`, `IsExpr`, or `RangeCond` nodes. Affected both the main `execSelect` pipeline and all subquery paths.
+- **`time.Time` named-parameter truncation** — `ExecNamed`, `ExecStruct`, and `InsertStruct` previously always emitted `DATE('…')` for `time.Time` parameters, silently dropping hours/minutes/seconds. They now emit `DATETIME('…')` when the time component is non-zero, and `DATE('…')` only for midnight-valued times.
+- **`Save`/`Load` round-trip** — verified and fixed for every `Kind` (Null, Bool, Int, Float, String, Date with time component, JSON object, JSON array), `EnumSets`, and the `Locked` flag.
 
 ### 2026-05-11
 

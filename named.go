@@ -2,6 +2,7 @@ package vapordb
 
 import (
 	"encoding"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -191,7 +192,12 @@ func anyToSQLLiteral(v any) (string, error) {
 		if t.IsZero() {
 			return "NULL", nil
 		}
-		return fmt.Sprintf("DATE('%s')", t.UTC().Format("2006-01-02 15:04:05")), nil
+		u := t.UTC()
+		// Preserve the time-of-day component: use DATETIME when non-midnight.
+		if u.Hour() != 0 || u.Minute() != 0 || u.Second() != 0 || u.Nanosecond() != 0 {
+			return fmt.Sprintf("DATETIME('%s')", u.Format("2006-01-02 15:04:05")), nil
+		}
+		return fmt.Sprintf("DATE('%s')", u.Format("2006-01-02")), nil
 	}
 	if dv, ok := valuerOf(rv); ok {
 		dbVal, err := dv.Value()
@@ -239,6 +245,15 @@ func anyToSQLLiteral(v any) (string, error) {
 		}
 		return strings.Join(parts, ", "), nil
 	}
+	// Maps are serialised as JSON wrapped in json_parse(…).
+	if rv.Kind() == reflect.Map {
+		b, err := json.Marshal(rv.Interface())
+		if err != nil {
+			return "", fmt.Errorf("marshaling map to JSON: %w", err)
+		}
+		return "json_parse('" + strings.ReplaceAll(string(b), "'", "''") + "')", nil
+	}
+
 	switch rv.Kind() { //nolint:exhaustive
 	case reflect.String:
 		s := strings.ReplaceAll(rv.String(), "'", "''")

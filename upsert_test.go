@@ -6,7 +6,7 @@ import "testing"
 
 func TestRewriteOnConflictDoUpdate(t *testing.T) {
 	sql := "INSERT INTO t (id, name) VALUES (1, 'alice') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name"
-	got, cols, doNothing := rewriteOnConflict(sql)
+	got, cols, doNothing, _ := rewriteOnConflict(sql)
 
 	if doNothing {
 		t.Fatal("expected doNothing=false")
@@ -22,7 +22,7 @@ func TestRewriteOnConflictDoUpdate(t *testing.T) {
 
 func TestRewriteOnConflictDoNothing(t *testing.T) {
 	sql := "INSERT INTO t (id, name) VALUES (1, 'alice') ON CONFLICT (id) DO NOTHING"
-	got, cols, doNothing := rewriteOnConflict(sql)
+	got, cols, doNothing, _ := rewriteOnConflict(sql)
 
 	if !doNothing {
 		t.Fatal("expected doNothing=true")
@@ -38,7 +38,7 @@ func TestRewriteOnConflictDoNothing(t *testing.T) {
 
 func TestRewriteOnConflictMultipleConflictCols(t *testing.T) {
 	sql := "INSERT INTO t (a, b, c) VALUES (1, 2, 3) ON CONFLICT (a, b) DO UPDATE SET c = EXCLUDED.c"
-	_, cols, _ := rewriteOnConflict(sql)
+	_, cols, _, _ := rewriteOnConflict(sql)
 	if len(cols) != 2 || cols[0] != "a" || cols[1] != "b" {
 		t.Errorf("expected [a b], got %v", cols)
 	}
@@ -46,7 +46,7 @@ func TestRewriteOnConflictMultipleConflictCols(t *testing.T) {
 
 func TestRewriteNoOnConflict(t *testing.T) {
 	sql := "INSERT INTO t (id, name) VALUES (1, 'alice')"
-	got, cols, doNothing := rewriteOnConflict(sql)
+	got, cols, doNothing, _ := rewriteOnConflict(sql)
 	if got != sql || len(cols) != 0 || doNothing {
 		t.Errorf("plain INSERT should pass through unchanged; got %q %v %v", got, cols, doNothing)
 	}

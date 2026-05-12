@@ -20,8 +20,9 @@ const (
 
 // winBound describes one endpoint of a window frame.
 type winBound struct {
-	kind   int // winBound* constant
-	offset int // rows distance for PRECEDING / FOLLOWING (ROWS mode)
+	kind        int     // winBound* constant
+	offset      int     // row distance for PRECEDING / FOLLOWING (ROWS mode)
+	valueOffset float64 // value distance for PRECEDING / FOLLOWING (RANGE mode)
 }
 
 // ── AST ───────────────────────────────────────────────────────────────────────
@@ -352,11 +353,15 @@ func parseSingleBound(s string) winBound {
 	case upper == "UNBOUNDED FOLLOWING":
 		return winBound{kind: winBoundUnboundedFollowing}
 	case strings.HasSuffix(upper, " PRECEDING"):
-		n, _ := strconv.Atoi(strings.TrimSuffix(upper, " PRECEDING"))
-		return winBound{kind: winBoundPreceding, offset: n}
+		raw := strings.TrimSuffix(upper, " PRECEDING")
+		n, _ := strconv.Atoi(raw)
+		f, _ := strconv.ParseFloat(raw, 64)
+		return winBound{kind: winBoundPreceding, offset: n, valueOffset: f}
 	case strings.HasSuffix(upper, " FOLLOWING"):
-		n, _ := strconv.Atoi(strings.TrimSuffix(upper, " FOLLOWING"))
-		return winBound{kind: winBoundFollowing, offset: n}
+		raw := strings.TrimSuffix(upper, " FOLLOWING")
+		n, _ := strconv.Atoi(raw)
+		f, _ := strconv.ParseFloat(raw, 64)
+		return winBound{kind: winBoundFollowing, offset: n, valueOffset: f}
 	}
 	return winBound{kind: winBoundCurrentRow}
 }
@@ -558,31 +563,164 @@ func winBoundRow(pos, n int, b winBound) int {
 	return pos
 }
 
-// winRangeFrame computes the RANGE-mode frame, supporting:
-//   - UNBOUNDED PRECEDING … UNBOUNDED FOLLOWING → whole partition
-//   - UNBOUNDED PRECEDING … CURRENT ROW         → rows through last peer
-//   - CURRENT ROW         … UNBOUNDED FOLLOWING → rows from first peer to end
+// winRangeFrame computes the RANGE-mode frame.
+//
+// Peer-based bounds (CURRENT ROW, UNBOUNDED PRECEDING/FOLLOWING) are computed
+// by finding the first/last row that has an equal ORDER BY value.
+//
+// Value-based bounds (N PRECEDING / N FOLLOWING) are computed by comparing the
+// numeric ORDER BY column value of the current row against every partition row:
+//   - N PRECEDING (ASC):  include rows where col >= current_col - N
+//   - N PRECEDING (DESC): include rows where col <= current_col + N
+//   - N FOLLOWING (ASC):  include rows where col <= current_col + N
+//   - N FOLLOWING (DESC): include rows where col >= current_col - N
+//
+// The function works with int64 or float64 ORDER BY columns. When the ORDER BY
+// column is not numeric it falls back to peer-based CURRENT ROW semantics.
 func winRangeFrame(pos, n int, indices []int, rows []Row, start, end winBound, orderBy []winOrder) (lo, hi int) {
-	switch {
-	case start.kind == winBoundUnboundedPreceding && end.kind == winBoundUnboundedFollowing:
+	// ── Peer-only combinations ────────────────────────────────────────────
+	if start.kind == winBoundUnboundedPreceding && end.kind == winBoundUnboundedFollowing {
 		return 0, n
-	case start.kind == winBoundUnboundedPreceding && end.kind == winBoundCurrentRow:
+	}
+
+	// For value-based bounds determine the numeric current value and direction.
+	needsValue := (start.kind == winBoundPreceding || start.kind == winBoundFollowing ||
+		end.kind == winBoundPreceding || end.kind == winBoundFollowing)
+
+	var curVal float64
+	descOrder := len(orderBy) > 0 && orderBy[0].desc
+	if needsValue && len(orderBy) > 0 {
+		curVal = winNumericValue(rows[indices[pos]], orderBy[0].col)
+	}
+
+	// ── lo bound ─────────────────────────────────────────────────────────
+	switch start.kind {
+	case winBoundUnboundedPreceding:
 		lo = 0
-		hi = pos + 1
-		for hi < n && winEqual(rows[indices[pos]], rows[indices[hi]], orderBy) {
-			hi++
-		}
-	case start.kind == winBoundCurrentRow && end.kind == winBoundUnboundedFollowing:
+	case winBoundCurrentRow:
+		// First peer of current row.
 		lo = pos
 		for lo > 0 && winEqual(rows[indices[pos]], rows[indices[lo-1]], orderBy) {
 			lo--
 		}
+	case winBoundPreceding:
+		if !needsValue || len(orderBy) == 0 {
+			lo = 0
+		} else {
+			// ASC: include rows where col >= curVal - N
+			// DESC: include rows where col <= curVal + N
+			lo = 0
+			if !descOrder {
+				thresh := curVal - start.valueOffset
+				for lo < n && winNumericValue(rows[indices[lo]], orderBy[0].col) < thresh {
+					lo++
+				}
+			} else {
+				thresh := curVal + start.valueOffset
+				for lo < n && winNumericValue(rows[indices[lo]], orderBy[0].col) > thresh {
+					lo++
+				}
+			}
+		}
+	case winBoundFollowing:
+		if !needsValue || len(orderBy) == 0 {
+			lo = pos
+		} else {
+			// ASC: rows where col >= curVal + N (start > current → unusual but valid)
+			// DESC: rows where col <= curVal - N
+			lo = pos
+			if !descOrder {
+				thresh := curVal + start.valueOffset
+				for lo < n && winNumericValue(rows[indices[lo]], orderBy[0].col) < thresh {
+					lo++
+				}
+			} else {
+				thresh := curVal - start.valueOffset
+				for lo < n && winNumericValue(rows[indices[lo]], orderBy[0].col) > thresh {
+					lo++
+				}
+			}
+		}
+	}
+
+	// ── hi bound (exclusive) ─────────────────────────────────────────────
+	switch end.kind {
+	case winBoundUnboundedFollowing:
 		hi = n
-	default:
-		// Unsupported RANGE combination: fall back to current row only.
-		lo, hi = pos, pos+1
+	case winBoundCurrentRow:
+		// Last peer of current row + 1.
+		hi = pos + 1
+		for hi < n && winEqual(rows[indices[pos]], rows[indices[hi]], orderBy) {
+			hi++
+		}
+	case winBoundFollowing:
+		if !needsValue || len(orderBy) == 0 {
+			hi = n
+		} else {
+			// ASC: include rows where col <= curVal + N
+			// DESC: include rows where col >= curVal - N
+			hi = pos + 1
+			if !descOrder {
+				thresh := curVal + end.valueOffset
+				for hi < n && winNumericValue(rows[indices[hi]], orderBy[0].col) <= thresh {
+					hi++
+				}
+			} else {
+				thresh := curVal - end.valueOffset
+				for hi < n && winNumericValue(rows[indices[hi]], orderBy[0].col) >= thresh {
+					hi++
+				}
+			}
+		}
+	case winBoundPreceding:
+		if !needsValue || len(orderBy) == 0 {
+			hi = pos + 1
+		} else {
+			// ASC: include rows where col <= curVal - N
+			// DESC: include rows where col >= curVal + N
+			hi = pos + 1
+			if !descOrder {
+				thresh := curVal - end.valueOffset
+				for hi > 0 && winNumericValue(rows[indices[hi-1]], orderBy[0].col) > thresh {
+					hi--
+				}
+			} else {
+				thresh := curVal + end.valueOffset
+				for hi > 0 && winNumericValue(rows[indices[hi-1]], orderBy[0].col) < thresh {
+					hi--
+				}
+			}
+		}
+	}
+
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > n {
+		hi = n
+	}
+	if hi < lo {
+		hi = lo
 	}
 	return
+}
+
+// winNumericValue extracts a float64 from a row column (used for RANGE value-based frames).
+// Returns 0 for non-numeric kinds (NULLs, strings, etc.).
+func winNumericValue(row Row, col string) float64 {
+	v := winArg(row, col)
+	switch x := v.V.(type) {
+	case int64:
+		return float64(x)
+	case float64:
+		return x
+	case bool:
+		if x {
+			return 1
+		}
+		return 0
+	}
+	return 0
 }
 
 // ── Aggregate helpers ─────────────────────────────────────────────────────────

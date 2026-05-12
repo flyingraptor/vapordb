@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -180,13 +181,17 @@ func structFieldToSQL(v reflect.Value) string {
 		v = v.Elem()
 	}
 
-	// 3. time.Time — handle explicitly so we control the DATE(…) format.
+	// 3. time.Time — handle explicitly so we control the DATE/DATETIME format.
 	if v.Type() == timeType {
 		t := v.Interface().(time.Time)
 		if t.IsZero() {
 			return "NULL"
 		}
-		return fmt.Sprintf("DATE('%s')", t.UTC().Format("2006-01-02 15:04:05"))
+		u := t.UTC()
+		if u.Hour() != 0 || u.Minute() != 0 || u.Second() != 0 || u.Nanosecond() != 0 {
+			return fmt.Sprintf("DATETIME('%s')", u.Format("2006-01-02 15:04:05"))
+		}
+		return fmt.Sprintf("DATE('%s')", u.Format("2006-01-02"))
 	}
 
 	// 4. driver.Valuer (value receiver or pointer receiver).
@@ -221,6 +226,13 @@ func structFieldToSQL(v reflect.Value) string {
 			return "1"
 		}
 		return "0"
+	case reflect.Map, reflect.Slice:
+		// Marshal maps and slices as JSON and wrap with json_parse(…).
+		b, err := json.Marshal(v.Interface())
+		if err != nil {
+			return "NULL"
+		}
+		return "json_parse(" + quotedString(string(b)) + ")"
 	}
 	return "NULL"
 }
@@ -283,6 +295,14 @@ func setStructField(field reflect.Value, val Value) {
 	// 5. Primitive kinds.
 	switch field.Kind() { //nolint:exhaustive
 	case reflect.String:
+		if val.Kind == KindJSON {
+			// Serialise JSON back to a string when the target field is string.
+			b, err := json.Marshal(val.V)
+			if err == nil {
+				field.SetString(string(b))
+				return
+			}
+		}
 		field.SetString(fmt.Sprintf("%v", val.V))
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		switch n := val.V.(type) {
@@ -304,6 +324,18 @@ func setStructField(field reflect.Value, val Value) {
 			field.SetBool(b)
 		case int64:
 			field.SetBool(b != 0)
+		}
+	case reflect.Map, reflect.Slice, reflect.Interface:
+		// Deserialise a KindJSON value into the target map/slice/interface field.
+		if val.Kind == KindJSON && field.CanSet() {
+			jsonBytes, err := json.Marshal(val.V)
+			if err != nil {
+				return
+			}
+			ptr := reflect.New(field.Type())
+			if err := json.Unmarshal(jsonBytes, ptr.Interface()); err == nil {
+				field.Set(ptr.Elem())
+			}
 		}
 	}
 }
@@ -330,6 +362,11 @@ func driverValueToSQL(v driver.Value) string {
 	case nil:
 		return "NULL"
 	case string:
+		// Detect PostgreSQL array literals produced by pq.Array(slice).Value()
+		// e.g. "{A001,A002}" → 'A001', 'A002'  (for use inside IN (…))
+		if expanded, ok := expandPGArrayLiteral(x); ok {
+			return expanded
+		}
 		return quotedString(x)
 	case []byte:
 		return quotedString(string(x))
@@ -346,8 +383,93 @@ func driverValueToSQL(v driver.Value) string {
 		if x.IsZero() {
 			return "NULL"
 		}
-		return fmt.Sprintf("DATE('%s')", x.UTC().Format("2006-01-02 15:04:05"))
+		u := x.UTC()
+		if u.Hour() != 0 || u.Minute() != 0 || u.Second() != 0 || u.Nanosecond() != 0 {
+			return fmt.Sprintf("DATETIME('%s')", u.Format("2006-01-02 15:04:05"))
+		}
+		return fmt.Sprintf("DATE('%s')", u.Format("2006-01-02"))
 	default:
 		return quotedString(fmt.Sprintf("%v", x))
 	}
+}
+
+// ── PostgreSQL array literal helpers ─────────────────────────────────────────
+//
+// pq.Array(slice).Value() returns a PostgreSQL array string like "{A001,A002}".
+// These helpers detect that format and expand it to a SQL comma-separated
+// literal list suitable for use inside IN (…).
+
+// isPGArrayLiteral reports whether s looks like a PostgreSQL array literal.
+func isPGArrayLiteral(s string) bool {
+	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+// expandPGArrayLiteral parses a PostgreSQL array literal such as "{A001,A002}"
+// or "{1,2,3}" and returns a SQL comma-separated list of literals.
+//
+// Empty array "{}" returns ("NULL", true) — IN (NULL) never matches any row,
+// which is the correct semantics for an empty exclusion/inclusion set.
+//
+// Returns ("", false) if s is not a PostgreSQL array literal.
+func expandPGArrayLiteral(s string) (string, bool) {
+	if !isPGArrayLiteral(s) {
+		return "", false
+	}
+	inner := s[1 : len(s)-1]
+	if inner == "" {
+		return "NULL", true // empty array → safe no-op for IN
+	}
+	elems := parsePGArrayElems(inner)
+	lits := make([]string, len(elems))
+	for i, e := range elems {
+		if strings.EqualFold(e, "NULL") {
+			lits[i] = "NULL"
+		} else if _, err := strconv.ParseInt(e, 10, 64); err == nil {
+			lits[i] = e // numeric — no quotes needed
+		} else if _, err := strconv.ParseFloat(e, 64); err == nil {
+			lits[i] = e
+		} else {
+			lits[i] = quotedString(e)
+		}
+	}
+	return strings.Join(lits, ", "), true
+}
+
+// parsePGArrayElems splits the inner content of a PostgreSQL array literal
+// (i.e. what's between the outer { and }) by commas, honoring double-quoted
+// elements that may contain commas or backslash-escaped characters.
+func parsePGArrayElems(s string) []string {
+	var elems []string
+	var cur strings.Builder
+	i := 0
+	for i < len(s) {
+		switch s[i] {
+		case '"':
+			i++ // skip opening "
+			for i < len(s) && s[i] != '"' {
+				if s[i] == '\\' {
+					i++
+					if i < len(s) {
+						cur.WriteByte(s[i])
+						i++
+					}
+				} else {
+					cur.WriteByte(s[i])
+					i++
+				}
+			}
+			if i < len(s) {
+				i++ // skip closing "
+			}
+		case ',':
+			elems = append(elems, cur.String())
+			cur.Reset()
+			i++
+		default:
+			cur.WriteByte(s[i])
+			i++
+		}
+	}
+	elems = append(elems, cur.String())
+	return elems
 }

@@ -133,12 +133,12 @@ func copyRowSlice(rows []Row) []Row {
 // per VALUES tuple that was inserted or updated by upsert (DO UPDATE), in
 // order. DO NOTHING skips do not appear. If a schema conflict wipe occurred,
 // all rows currently in the table are returned.
-func execInsertReturning(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool) ([]Row, error) {
+func execInsertReturning(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool, upsertWhere string) ([]Row, error) {
 	tblName := stmt.Table.Name.String()
 
 	var affectedIdx []int
 	var schemaWiped bool
-	if err := execInsert(db, stmt, conflictCols, doNothing, forceWipeOnSchemaConflict, &schemaWiped, &affectedIdx); err != nil {
+	if err := execInsert(db, stmt, conflictCols, doNothing, forceWipeOnSchemaConflict, &schemaWiped, &affectedIdx, upsertWhere); err != nil {
 		return nil, err
 	}
 
@@ -279,7 +279,7 @@ func execDeleteReturning(db *DB, stmt *sqlparser.Delete) ([]Row, error) {
 // execDMLReturning parses a DML statement (INSERT / UPDATE / DELETE), executes
 // it, and returns the affected rows projected through the RETURNING column list.
 func execDMLReturning(db *DB, sql string, retCols string, forceWipeOnSchemaConflict bool) ([]Row, error) {
-	rewritten, conflictCols, doNothing := rewriteOnConflict(rewriteAnyAll(sql))
+	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(sql))))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
@@ -288,7 +288,7 @@ func execDMLReturning(db *DB, sql string, retCols string, forceWipeOnSchemaConfl
 	var rows []Row
 	switch s := stmt.(type) {
 	case *sqlparser.Insert:
-		rows, err = execInsertReturning(db, s, conflictCols, doNothing, forceWipeOnSchemaConflict)
+		rows, err = execInsertReturning(db, s, conflictCols, doNothing, forceWipeOnSchemaConflict, upsertWhere)
 	case *sqlparser.Update:
 		rows, err = execUpdateReturning(db, s)
 	case *sqlparser.Delete:

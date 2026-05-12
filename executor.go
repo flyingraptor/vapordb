@@ -306,7 +306,7 @@ func execUnionNode(db *DB, stmt *sqlparser.Union) ([]Row, error) {
 // index is appended (in VALUES order), so INSERT … RETURNING can include
 // ON CONFLICT DO UPDATE results. DO NOTHING conflicts append nothing. Skipped
 // when nil (e.g. plain Exec).
-func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool, trackSchemaWipe *bool, affectedRowIdx *[]int) error {
+func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool, trackSchemaWipe *bool, affectedRowIdx *[]int, upsertWhere string) error {
 	tableName := stmt.Table.Name.String()
 
 	values, ok := stmt.Rows.(sqlparser.Values)
@@ -353,24 +353,36 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 				*trackSchemaWipe = true
 			}
 			tbl := db.Tables[tableName]
-			if idx := findConflict(tbl, conflictCols, row); idx >= 0 {
-				// Conflict found.
-				if doNothing {
-					continue // skip this row silently
-				}
-				// Apply ON DUPLICATE KEY UPDATE assignments.
-				if err := applyOnDup(db, tbl.Rows[idx], row, stmt.OnDup); err != nil {
-					return err
-				}
-				// Re-validate after the update assignments.
-				if err := validateEnum(tbl, tbl.Rows[idx]); err != nil {
-					return err
-				}
-				if affectedRowIdx != nil {
-					*affectedRowIdx = append(*affectedRowIdx, idx)
-				}
-				continue
+		if idx := findConflict(tbl, conflictCols, row); idx >= 0 {
+			// Conflict found.
+			if doNothing {
+				continue // skip this row silently
 			}
+			// Gap 4: optimistic-lock predicate — evaluate against the existing row.
+			// If the predicate is false the update is silently skipped (matching
+			// PostgreSQL's "no rows updated" semantics for failed lock checks).
+			if upsertWhere != "" {
+				ok, err := evalUpsertWhere(db, upsertWhere, tbl.Rows[idx])
+				if err != nil {
+					return fmt.Errorf("evaluating upsert WHERE predicate: %w", err)
+				}
+				if !ok {
+					continue
+				}
+			}
+			// Apply ON DUPLICATE KEY UPDATE assignments.
+			if err := applyOnDup(db, tbl.Rows[idx], row, stmt.OnDup); err != nil {
+				return err
+			}
+			// Re-validate after the update assignments.
+			if err := validateEnum(tbl, tbl.Rows[idx]); err != nil {
+				return err
+			}
+			if affectedRowIdx != nil {
+				*affectedRowIdx = append(*affectedRowIdx, idx)
+			}
+			continue
+		}
 		}
 		// ── Normal insert ────────────────────────────────────────────────────
 		w, err := UpsertSchema(db, tableName, row, forceWipeOnSchemaConflict)
@@ -445,6 +457,21 @@ func applyOnDup(db *DB, target Row, incoming Row, onDup sqlparser.OnDup) error {
 	return nil
 }
 
+// evalUpsertWhere parses a bare SQL predicate string and evaluates it against
+// existingRow. It is used to implement the optimistic-lock WHERE clause of
+// ON CONFLICT DO UPDATE … WHERE <pred>.
+func evalUpsertWhere(db *DB, pred string, existingRow Row) (bool, error) {
+	stmt, err := sqlparser.Parse("SELECT 1 WHERE " + pred)
+	if err != nil {
+		return false, fmt.Errorf("invalid upsert WHERE predicate %q: %w", pred, err)
+	}
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok || sel.Where == nil {
+		return false, fmt.Errorf("could not extract WHERE expression from upsert predicate: %s", pred)
+	}
+	return evalBoolWithDB(db, sel.Where.Expr, existingRow)
+}
+
 // ─── SELECT ──────────────────────────────────────────────────────────────────
 
 func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
@@ -486,9 +513,15 @@ func execSelect(db *DB, stmt *sqlparser.Select) ([]Row, error) {
 	}
 
 	// GROUP BY / aggregates.
+	// Pass HAVING expression so aggregates referenced only in HAVING (e.g.
+	// HAVING COUNT(*) > 1 when SELECT has no COUNT) are pre-computed per group.
 	hasAgg := selectHasAggregates(stmt.SelectExprs)
 	if len(stmt.GroupBy) > 0 || hasAgg {
-		rows, err = applyGroupBy(db, rows, stmt.GroupBy, stmt.SelectExprs)
+		var havingExpr sqlparser.Expr
+		if stmt.Having != nil {
+			havingExpr = stmt.Having.Expr
+		}
+		rows, err = applyGroupBy(db, rows, stmt.GroupBy, stmt.SelectExprs, havingExpr)
 		if err != nil {
 			return nil, err
 		}
@@ -615,10 +648,15 @@ func applyWhere(db *DB, rows []Row, where *sqlparser.Where) ([]Row, error) {
 	return result, nil
 }
 
-func applyGroupBy(db *DB, rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.SelectExprs) ([]Row, error) {
+// applyGroupBy groups rows by groupBy keys, applies aggregate functions from
+// selectExprs (and optionally a HAVING expr so that HAVING aggregates not
+// present in SELECT are still pre-computed), and returns one projected row per
+// group. Callers should pass a non-nil having when they intend to filter the
+// result with applyWhere / evalBoolWithDB afterwards.
+func applyGroupBy(db *DB, rows []Row, groupBy sqlparser.GroupBy, selectExprs sqlparser.SelectExprs, having ...sqlparser.Expr) ([]Row, error) {
 	if len(groupBy) == 0 {
 		// No GROUP BY but aggregates present → treat all rows as one group.
-		out, err := computeGroup(db, rows, selectExprs)
+		out, err := computeGroup(db, rows, selectExprs, having...)
 		if err != nil {
 			return nil, err
 		}
@@ -640,7 +678,7 @@ func applyGroupBy(db *DB, rows []Row, groupBy sqlparser.GroupBy, selectExprs sql
 
 	result := make([]Row, 0, len(groupOrder))
 	for _, key := range groupOrder {
-		out, err := computeGroup(db, groupMap[key], selectExprs)
+		out, err := computeGroup(db, groupMap[key], selectExprs, having...)
 		if err != nil {
 			return nil, err
 		}
@@ -661,11 +699,19 @@ func computeGroupKey(db *DB, row Row, groupBy sqlparser.GroupBy) (string, error)
 	return strings.Join(parts, "\x01"), nil
 }
 
-func computeGroup(db *DB, rows []Row, selectExprs sqlparser.SelectExprs) (Row, error) {
+func computeGroup(db *DB, rows []Row, selectExprs sqlparser.SelectExprs, extraExprs ...sqlparser.Expr) (Row, error) {
 	firstRow := Row{}
 	if len(rows) > 0 {
 		firstRow = rows[0]
 	}
+
+	// Build an "aggRow" that contains all non-NULL aggregate sub-expressions
+	// pre-computed and stored under their canonical SQL string keys.
+	// evalExpr already knows to look up aggregate functions in the row
+	// so COALESCE(SUM(…), 0) and HAVING COUNT(*) > 1 work automatically
+	// once the aggregate result is in the row.
+	aggRow := precomputeGroupAggs(db, rows, selectExprs, firstRow, extraExprs...)
+
 	out := make(Row)
 	for _, se := range selectExprs {
 		switch s := se.(type) {
@@ -680,7 +726,10 @@ func computeGroup(db *DB, rows []Row, selectExprs sqlparser.SelectExprs) (Row, e
 			if fe, ok := s.Expr.(*sqlparser.FuncExpr); ok && isAggFunc(fe.Name.Lowered()) {
 				val, err = evalAggFunc(db, fe, rows)
 			} else {
-				val, err = evalExpr(db, s.Expr, firstRow)
+				// Use aggRow so that aggregate sub-expressions nested inside
+				// scalar wrappers (COALESCE, IFNULL, arithmetic, …) resolve
+				// to their pre-computed group values.
+				val, err = evalExpr(db, s.Expr, aggRow)
 			}
 			if err != nil {
 				return nil, err
@@ -693,7 +742,97 @@ func computeGroup(db *DB, rows []Row, selectExprs sqlparser.SelectExprs) (Row, e
 			}
 		}
 	}
+
+	// Copy pre-computed aggregate values (e.g. "sum(case when …)") into the
+	// output row so that the subsequent projectRows call can resolve aggregate
+	// sub-expressions that are wrapped inside scalar functions like COALESCE.
+	for k, v := range aggRow {
+		if _, exists := out[k]; !exists {
+			if _, inFirstRow := firstRow[k]; !inFirstRow {
+				out[k] = v
+			}
+		}
+	}
+
 	return out, nil
+}
+
+// precomputeGroupAggs recursively collects every aggregate FuncExpr that
+// appears inside selectExprs (and optional extra expressions such as a HAVING
+// clause), evaluates each against rows, and stores the result in a copy of
+// firstRow keyed by the canonical SQL string. evalExpr will find these values
+// when it encounters the same aggregate function expression.
+func precomputeGroupAggs(db *DB, rows []Row, selectExprs sqlparser.SelectExprs, firstRow Row, extraExprs ...sqlparser.Expr) Row {
+	aggRow := make(Row, len(firstRow)+8)
+	for k, v := range firstRow {
+		aggRow[k] = v
+	}
+	for _, se := range selectExprs {
+		if ae, ok := se.(*sqlparser.AliasedExpr); ok {
+			collectGroupAggs(db, ae.Expr, rows, aggRow)
+		}
+	}
+	for _, expr := range extraExprs {
+		if expr != nil {
+			collectGroupAggs(db, expr, rows, aggRow)
+		}
+	}
+	return aggRow
+}
+
+// collectGroupAggs walks expr, finds aggregate FuncExprs, evaluates each one,
+// and stores the result in aggRow under the canonical SQL string key.
+func collectGroupAggs(db *DB, expr sqlparser.Expr, rows []Row, aggRow Row) {
+	if expr == nil {
+		return
+	}
+	switch e := expr.(type) {
+	case *sqlparser.FuncExpr:
+		if isAggFunc(e.Name.Lowered()) {
+			key := strings.ToLower(sqlparser.String(e))
+			if _, already := aggRow[key]; !already {
+				if v, err := evalAggFunc(db, e, rows); err == nil {
+					aggRow[key] = v
+				}
+			}
+			return // don't recurse into aggregate arguments
+		}
+		for _, arg := range e.Exprs {
+			if ae, ok := arg.(*sqlparser.AliasedExpr); ok {
+				collectGroupAggs(db, ae.Expr, rows, aggRow)
+			}
+		}
+	case *sqlparser.BinaryExpr:
+		collectGroupAggs(db, e.Left, rows, aggRow)
+		collectGroupAggs(db, e.Right, rows, aggRow)
+	case *sqlparser.ComparisonExpr:
+		collectGroupAggs(db, e.Left, rows, aggRow)
+		collectGroupAggs(db, e.Right, rows, aggRow)
+	case *sqlparser.AndExpr:
+		collectGroupAggs(db, e.Left, rows, aggRow)
+		collectGroupAggs(db, e.Right, rows, aggRow)
+	case *sqlparser.OrExpr:
+		collectGroupAggs(db, e.Left, rows, aggRow)
+		collectGroupAggs(db, e.Right, rows, aggRow)
+	case *sqlparser.NotExpr:
+		collectGroupAggs(db, e.Expr, rows, aggRow)
+	case *sqlparser.ParenExpr:
+		collectGroupAggs(db, e.Expr, rows, aggRow)
+	case *sqlparser.CaseExpr:
+		for _, when := range e.Whens {
+			collectGroupAggs(db, when.Cond, rows, aggRow)
+			collectGroupAggs(db, when.Val, rows, aggRow)
+		}
+		if e.Else != nil {
+			collectGroupAggs(db, e.Else, rows, aggRow)
+		}
+	case *sqlparser.IsExpr:
+		collectGroupAggs(db, e.Expr, rows, aggRow)
+	case *sqlparser.RangeCond:
+		collectGroupAggs(db, e.Left, rows, aggRow)
+		collectGroupAggs(db, e.From, rows, aggRow)
+		collectGroupAggs(db, e.To, rows, aggRow)
+	}
 }
 
 func evalAggFunc(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
@@ -708,6 +847,8 @@ func evalAggFunc(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 		return aggMin(db, fe, rows)
 	case "max":
 		return aggMax(db, fe, rows)
+	case "array_agg":
+		return aggArrayAgg(db, fe, rows)
 	}
 	return Null, fmt.Errorf("unknown aggregate function: %s", fe.Name.Lowered())
 }
@@ -852,6 +993,31 @@ func aggMax(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
 	return *maxVal, nil
 }
 
+// aggArrayAgg collects all non-NULL values of its argument into a JSON array
+// (KindJSON with []any underlying type). NULL values are silently skipped.
+// When no rows produce a non-NULL value, NULL is returned (PostgreSQL semantics).
+func aggArrayAgg(db *DB, fe *sqlparser.FuncExpr, rows []Row) (Value, error) {
+	argExpr, err := aggArgExpr(fe)
+	if err != nil {
+		return Null, err
+	}
+	var arr []any
+	for _, row := range rows {
+		v, err := evalExpr(db, argExpr, row)
+		if err != nil {
+			return Null, err
+		}
+		if v.Kind == KindNull {
+			continue
+		}
+		arr = append(arr, v.V)
+	}
+	if arr == nil {
+		return Null, nil
+	}
+	return Value{Kind: KindJSON, V: arr}, nil
+}
+
 func aggIsStar(fe *sqlparser.FuncExpr) bool {
 	if len(fe.Exprs) != 1 {
 		return false
@@ -873,7 +1039,7 @@ func aggArgExpr(fe *sqlparser.FuncExpr) (sqlparser.Expr, error) {
 
 func isAggFunc(name string) bool {
 	switch name {
-	case "count", "sum", "avg", "min", "max":
+	case "count", "sum", "avg", "min", "max", "array_agg":
 		return true
 	}
 	return false
@@ -895,7 +1061,18 @@ func selectHasAggregates(exprs sqlparser.SelectExprs) bool {
 func exprContainsAgg(expr sqlparser.Expr) bool {
 	switch e := expr.(type) {
 	case *sqlparser.FuncExpr:
-		return isAggFunc(e.Name.Lowered())
+		if isAggFunc(e.Name.Lowered()) {
+			return true
+		}
+		// Non-aggregate function: recurse into its arguments.
+		for _, arg := range e.Exprs {
+			if ae, ok := arg.(*sqlparser.AliasedExpr); ok {
+				if exprContainsAgg(ae.Expr) {
+					return true
+				}
+			}
+		}
+		return false
 	case *sqlparser.BinaryExpr:
 		return exprContainsAgg(e.Left) || exprContainsAgg(e.Right)
 	case *sqlparser.ParenExpr:
@@ -1299,51 +1476,90 @@ func qualifyOuterRow(db *DB, row Row) Row {
 
 // execSelectForIn runs a subquery on the RHS of IN / NOT IN with outerRow merged
 // for correlation, returning one projected row per surviving inner row.
+// Supports the full SELECT pipeline: GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT, UNION.
 func execSelectForIn(db *DB, sub *sqlparser.Subquery, outerRow Row) ([]Row, error) {
 	switch sel := sub.Select.(type) {
 	case *sqlparser.Select:
 		return execSelectForInSelect(db, sel, outerRow)
 	case *sqlparser.Union:
-		return nil, fmt.Errorf("IN (subquery): UNION is not supported yet")
+		// For correlated UNION subqueries, run each branch with correlation then
+		// re-apply the top-level ORDER BY / LIMIT using the existing execUnion
+		// helpers. Correlation is handled inside execSelectForInSelect per branch.
+		return execSelectForInUnion(db, sel, outerRow)
 	default:
 		return nil, fmt.Errorf("IN (subquery): unsupported subquery type %T", sub.Select)
 	}
 }
 
+// execSelectForInSelect runs a single SELECT as an IN subquery, supporting the
+// full pipeline: correlated WHERE, GROUP BY / aggregates, HAVING, ORDER BY,
+// LIMIT, DISTINCT. Must project exactly one column.
 func execSelectForInSelect(db *DB, inner *sqlparser.Select, outerRow Row) ([]Row, error) {
-	if len(inner.GroupBy) > 0 || selectHasAggregates(inner.SelectExprs) {
-		return nil, fmt.Errorf("IN (subquery): GROUP BY / aggregates are not supported yet")
-	}
-	if len(inner.OrderBy) > 0 || inner.Limit != nil {
-		return nil, fmt.Errorf("IN (subquery): ORDER BY / LIMIT are not supported yet")
-	}
-	if inner.Distinct == sqlparser.DistinctStr {
-		return nil, fmt.Errorf("IN (subquery): DISTINCT is not supported yet")
-	}
-	if inner.Having != nil {
-		return nil, fmt.Errorf("IN (subquery): HAVING is not supported yet")
-	}
 	if len(inner.SelectExprs) != 1 {
 		return nil, fmt.Errorf("IN (subquery): inner SELECT must have exactly one column")
 	}
 	if _, ok := inner.SelectExprs[0].(*sqlparser.StarExpr); ok {
 		return nil, fmt.Errorf("IN (subquery): use a single explicit column instead of SELECT *")
 	}
-	refs, _, err := extractFromClause(db, inner.From)
+
+	// FROM + JOINs + correlated WHERE.
+	rows, err := correlatedSubqueryFromWhere(db, inner, outerRow)
 	if err != nil {
 		return nil, err
 	}
-	if len(refs) == 0 {
-		return nil, fmt.Errorf("IN (subquery): no tables in FROM clause")
+
+	// GROUP BY / aggregates.
+	if len(inner.GroupBy) > 0 || selectHasAggregates(inner.SelectExprs) {
+		var havingExpr sqlparser.Expr
+		if inner.Having != nil {
+			havingExpr = inner.Having.Expr
+		}
+		rows, err = applyGroupBy(db, rows, inner.GroupBy, inner.SelectExprs, havingExpr)
+		if err != nil {
+			return nil, err
+		}
 	}
-	filtered, err := correlatedSubqueryFromWhere(db, inner, outerRow)
-	if err != nil {
-		return nil, err
+
+	// HAVING.
+	if inner.Having != nil {
+		qualifiedOuter := qualifyOuterRow(db, outerRow)
+		filtered := rows[:0]
+		for _, r := range rows {
+			merged := mergeRowsOuter(qualifiedOuter, r)
+			ok, herr := evalBoolWithDB(db, inner.Having.Expr, merged)
+			if herr != nil {
+				return nil, herr
+			}
+			if ok {
+				filtered = append(filtered, r)
+			}
+		}
+		rows = filtered
 	}
-	// Use qualified outer row for projection too, consistent with the WHERE step.
+
+	// ORDER BY.
+	if len(inner.OrderBy) > 0 {
+		rows, err = enrichWithAliases(db, rows, inner.SelectExprs)
+		if err != nil {
+			return nil, err
+		}
+		if err = sortRows(db, rows, inner.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+
+	// LIMIT.
+	if inner.Limit != nil {
+		rows, err = applyLimit(db, rows, inner.Limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Project.
 	qualifiedOuter := qualifyOuterRow(db, outerRow)
-	out := make([]Row, 0, len(filtered))
-	for _, r := range filtered {
+	out := make([]Row, 0, len(rows))
+	for _, r := range rows {
 		merged := mergeRowsOuter(qualifiedOuter, r)
 		pr, err := projectRow(db, merged, inner.SelectExprs, true)
 		if err != nil {
@@ -1351,7 +1567,62 @@ func execSelectForInSelect(db *DB, inner *sqlparser.Select, outerRow Row) ([]Row
 		}
 		out = append(out, pr)
 	}
+
+	// DISTINCT.
+	if inner.Distinct == sqlparser.DistinctStr {
+		out = distinctRows(out)
+	}
+
 	return out, nil
+}
+
+// execSelectForInUnion handles UNION / UNION ALL inside an IN (subquery).
+func execSelectForInUnion(db *DB, stmt *sqlparser.Union, outerRow Row) ([]Row, error) {
+	rows, err := execSelectForInUnionNode(db, stmt, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	if len(stmt.OrderBy) > 0 {
+		if err := sortRows(db, rows, stmt.OrderBy); err != nil {
+			return nil, err
+		}
+	}
+	if stmt.Limit != nil {
+		rows, err = applyLimit(db, rows, stmt.Limit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return rows, nil
+}
+
+func execSelectForInUnionNode(db *DB, stmt *sqlparser.Union, outerRow Row) ([]Row, error) {
+	var leftRows []Row
+	var err error
+	switch l := stmt.Left.(type) {
+	case *sqlparser.Select:
+		leftRows, err = execSelectForInSelect(db, l, outerRow)
+	case *sqlparser.Union:
+		leftRows, err = execSelectForInUnionNode(db, l, outerRow)
+	default:
+		return nil, fmt.Errorf("IN (subquery) UNION: unsupported left side %T", stmt.Left)
+	}
+	if err != nil {
+		return nil, err
+	}
+	rightSel, ok := stmt.Right.(*sqlparser.Select)
+	if !ok {
+		return nil, fmt.Errorf("IN (subquery) UNION: unsupported right side %T", stmt.Right)
+	}
+	rightRows, err := execSelectForInSelect(db, rightSel, outerRow)
+	if err != nil {
+		return nil, err
+	}
+	combined := append(leftRows, rightRows...)
+	if strings.EqualFold(stmt.Type, "union all") {
+		return combined, nil
+	}
+	return distinctRows(combined), nil
 }
 
 // projectedSingleColumn returns the sole value from a one-column projected row.
@@ -1389,7 +1660,11 @@ func execScalarSubquery(db *DB, inner *sqlparser.Select, outerRow Row) (Value, e
 	// GROUP BY / aggregates (e.g. SELECT COUNT(*) FROM …).
 	hasAgg := selectHasAggregates(inner.SelectExprs)
 	if len(inner.GroupBy) > 0 || hasAgg {
-		rows, err = applyGroupBy(db, rows, inner.GroupBy, inner.SelectExprs)
+		var havingExpr sqlparser.Expr
+		if inner.Having != nil {
+			havingExpr = inner.Having.Expr
+		}
+		rows, err = applyGroupBy(db, rows, inner.GroupBy, inner.SelectExprs, havingExpr)
 		if err != nil {
 			return Null, err
 		}
@@ -1510,6 +1785,8 @@ func isTruthy(v Value) bool {
 		if t, ok := v.V.(time.Time); ok {
 			return !t.IsZero()
 		}
+	case KindJSON:
+		return v.V != nil
 	}
 	return false
 }
@@ -1692,6 +1969,22 @@ func castValueToConvertType(v Value, ct *sqlparser.ConvertType) (Value, error) {
 	if strings.Contains(raw, "int") || strings.Contains(raw, "signed") || raw == "integer" ||
 		raw == "bigint" || raw == "smallint" || raw == "tinyint" {
 		return castSQLInt(v, false)
+	}
+	if raw == "json" || raw == "jsonb" {
+		if v.Kind == KindJSON {
+			return v, nil
+		}
+		if v.Kind == KindString {
+			jv, err := parseJSONValue(v.V.(string))
+			if err != nil {
+				return Null, fmt.Errorf("CAST … AS JSON: %w", err)
+			}
+			return jv, nil
+		}
+		if v.Kind == KindNull {
+			return Null, nil
+		}
+		return Null, fmt.Errorf("CAST/CONVERT: cannot convert %v to JSON", v.Kind)
 	}
 	return Null, fmt.Errorf("CAST/CONVERT: unsupported type %q", ct.Type)
 }
@@ -2332,6 +2625,15 @@ func evalScalarFunc(db *DB, e *sqlparser.FuncExpr, row Row) (Value, error) {
 		t := valueToTime(args[0])
 		return Value{Kind: KindDate, V: time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)}, nil
 
+	case "datetime", "timestamp":
+		// DATETIME(expr) / TIMESTAMP(expr) — parse a string or date value as a
+		// datetime, preserving the time-of-day component.
+		if len(args) < 1 || args[0].Kind == KindNull {
+			return Null, nil
+		}
+		t := valueToTime(args[0])
+		return Value{Kind: KindDate, V: t.UTC()}, nil
+
 	case "year":
 		if len(args) < 1 || args[0].Kind == KindNull {
 			return Null, nil
@@ -2466,6 +2768,79 @@ func evalScalarFunc(db *DB, e *sqlparser.FuncExpr, row Row) (Value, error) {
 			return Null, err
 		}
 		return Value{Kind: KindDate, V: result}, nil
+
+	// ── JSON functions ────────────────────────────────────────────────────────
+
+	case "json_extract":
+		if len(args) < 2 {
+			return Null, nil
+		}
+		path := valueString(args[1])
+		return jsonExtract(args[0], path), nil
+
+	case "json_unquote":
+		if len(args) < 1 {
+			return Null, nil
+		}
+		return jsonUnquote(args[0]), nil
+
+	case "json_contains":
+		if len(args) < 2 {
+			return Null, nil
+		}
+		if jsonContainsCheck(args[0], args[1]) {
+			return Value{Kind: KindBool, V: true}, nil
+		}
+		return Value{Kind: KindBool, V: false}, nil
+
+	case "json_parse":
+		if len(args) < 1 || args[0].Kind == KindNull {
+			return Null, nil
+		}
+		v, err := parseJSONValue(valueString(args[0]))
+		if err != nil {
+			return Null, err
+		}
+		return v, nil
+
+	case "json_array_length":
+		if len(args) < 1 {
+			return Null, nil
+		}
+		return jsonArrayLength(args[0]), nil
+
+	case "json_keys":
+		if len(args) < 1 {
+			return Null, nil
+		}
+		return jsonKeys(args[0]), nil
+
+	case "json_type":
+		if len(args) < 1 || args[0].Kind == KindNull {
+			return Null, nil
+		}
+		jv := args[0]
+		if jv.Kind == KindJSON {
+			switch jv.V.(type) {
+			case map[string]any:
+				return Value{Kind: KindString, V: "OBJECT"}, nil
+			case []any:
+				return Value{Kind: KindString, V: "ARRAY"}, nil
+			default:
+				return Value{Kind: KindString, V: "SCALAR"}, nil
+			}
+		}
+		switch jv.Kind {
+		case KindString:
+			return Value{Kind: KindString, V: "STRING"}, nil
+		case KindInt, KindFloat:
+			return Value{Kind: KindString, V: "INTEGER"}, nil
+		case KindBool:
+			return Value{Kind: KindString, V: "BOOLEAN"}, nil
+		case KindDate:
+			return Value{Kind: KindString, V: "STRING"}, nil
+		}
+		return Null, nil
 	}
 
 	return Null, fmt.Errorf("unknown function: %s", name)

@@ -17,6 +17,7 @@ const (
 	KindFloat  Kind = 3 // stored as float64
 	KindString Kind = 4
 	KindDate   Kind = 5 // stored as time.Time
+	KindJSON   Kind = 6 // stored as any (map[string]any, []any, or JSON scalar)
 )
 
 // Value is a tagged union representing a single SQL value.
@@ -65,6 +66,8 @@ func KindOf(v any) Kind {
 		return KindString
 	case time.Time:
 		return KindDate
+	case map[string]any, []any:
+		return KindJSON
 	}
 	return KindString
 }
@@ -104,6 +107,10 @@ func MakeValue(v any) Value {
 		return Value{Kind: KindString, V: x}
 	case time.Time:
 		return Value{Kind: KindDate, V: x}
+	case map[string]any:
+		return Value{Kind: KindJSON, V: x}
+	case []any:
+		return Value{Kind: KindJSON, V: x}
 	}
 	return Value{Kind: KindString, V: fmt.Sprintf("%v", v)}
 }
@@ -128,12 +135,17 @@ func Widen(a, b Kind) Kind {
 //   - Any transition between the numeric family and String (in either
 //     direction) is always an unsafe conflict — e.g. int→string and
 //     string→float both wipe.
+//   - JSON is its own family; any transition to or from KindJSON conflicts.
 func IsConflict(existing, incoming Kind) bool {
 	if existing == KindNull || incoming == KindNull {
 		return false
 	}
 	if existing == incoming {
 		return false
+	}
+	// JSON is its own family; any transition to or from KindJSON conflicts.
+	if existing == KindJSON || incoming == KindJSON {
+		return true
 	}
 	// Dates are their own family; any transition to or from KindDate conflicts.
 	if existing == KindDate || incoming == KindDate {
@@ -252,6 +264,13 @@ func valueString(v Value) string {
 		}
 		return t.UTC().Format("2006-01-02 15:04:05")
 	}
+	if v.Kind == KindJSON {
+		b, err := json.Marshal(v.V)
+		if err != nil {
+			return fmt.Sprintf("%v", v.V)
+		}
+		return string(b)
+	}
 	return fmt.Sprintf("%v", v.V)
 }
 
@@ -360,6 +379,7 @@ func (v Value) MarshalJSON() ([]byte, error) {
 		// Serialize as RFC3339 so the kind discriminant survives a round-trip.
 		wire.V = t.UTC().Format(time.RFC3339Nano)
 	}
+	// KindJSON: V is already any (map/slice), marshalled naturally by encoding/json.
 	return json.Marshal(wire)
 }
 
@@ -418,6 +438,12 @@ func (v *Value) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("decoding date: cannot parse %q", s)
 		}
 		v.V = t
+	case KindJSON:
+		var x any
+		if err := json.Unmarshal(raw.V, &x); err != nil {
+			return err
+		}
+		v.V = x
 	}
 	return nil
 }
