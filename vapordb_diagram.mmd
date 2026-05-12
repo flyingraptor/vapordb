@@ -1,18 +1,25 @@
 flowchart LR
-    code["Your Go code\n(goroutine-safe)"]
+    code["Your Go code<br/>(goroutine-safe)"]
+    orm["ORM / sqlx / bun<br/>(via database/sql driver)"]
 
     subgraph vapordb["vapordb (in-process)"]
         direction TB
-        infer["Schema Inference\nauto-evolves on INSERT\nnew columns appear on demand"]
-        tables[("In-memory Tables\nschema + rows")]
-        engine["SQL Engine\nSELECT · JOIN · GROUP BY · HAVING\nWINDOW · CTE · UNION · UPSERT\nRETURNING · subqueries · EXISTS"]
-        json[["JSON file\n(optional)"]]
+        infer["Schema Inference<br/>auto-evolves on INSERT<br/>new columns on demand<br/>enum constraints · schema locking"]
+        tables[("In-memory Tables<br/>schema + rows")]
+        engine["SQL Engine<br/>SELECT · JOIN · GROUP BY · HAVING · FILTER<br/>WINDOW (ROWS/RANGE frames) · CTE · UNION<br/>UPSERT · RETURNING · subqueries · EXISTS<br/>IN(subquery) · array_agg · scalar subqueries"]
+        tx["Transactions<br/>snapshot copy-on-write<br/>Begin · Commit · Rollback"]
+        json[["JSON file<br/>(optional)<br/>Save · Load"]]
+        ddl[["DDL output<br/>GenerateDDL<br/>(mysql · postgres)"]]
 
         infer --> tables
         engine <--> tables
+        tx -.-|snapshot| tables
         tables <-->|Save / Load| json
+        tables -->|GenerateDDL| ddl
     end
 
     code -->|"Exec  INSERT / UPDATE / DELETE"| infer
     code -->|"Query  SELECT"| engine
+    code -->|"Begin / Commit / Rollback"| tx
     engine -->|"[]Row"| code
+    orm -->|"sql.DB  ?  $N  placeholders"| engine
