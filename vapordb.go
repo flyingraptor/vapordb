@@ -15,6 +15,74 @@ import (
 	"github.com/xwb1989/sqlparser"
 )
 
+// rewriteDoubleQuotedIdents converts standard-SQL / PostgreSQL double-quoted
+// identifiers to MySQL backtick-quoted identifiers so the MySQL-dialect parser
+// accepts column and table names that happen to be reserved words (e.g. "name",
+// "type", "value", "key", "status", "schema").
+//
+// Only genuine identifier quotes are rewritten. Single-quoted string literals
+// are skipped verbatim, including the '' escape sequence inside them. The ""
+// escape sequence inside a double-quoted identifier (standard SQL) is preserved
+// as a literal double-quote inside the backtick identifier.
+//
+//	SELECT "name", "type" FROM "orders"   →   SELECT `name`, `type` FROM `orders`
+func rewriteDoubleQuotedIdents(sql string) string {
+	// Fast path: no double-quote in the input.
+	if !strings.ContainsRune(sql, '"') {
+		return sql
+	}
+	var b strings.Builder
+	b.Grow(len(sql))
+	i := 0
+	for i < len(sql) {
+		ch := sql[i]
+		switch ch {
+		case '\'': // single-quoted string literal — copy verbatim
+			b.WriteByte(ch)
+			i++
+			for i < len(sql) {
+				c := sql[i]
+				b.WriteByte(c)
+				i++
+				if c == '\'' {
+					// '' is the SQL escape for a literal single-quote inside a string.
+					if i < len(sql) && sql[i] == '\'' {
+						b.WriteByte(sql[i])
+						i++
+					} else {
+						break
+					}
+				}
+			}
+		case '"': // double-quoted identifier → backtick-quoted
+			b.WriteByte('`')
+			i++
+			for i < len(sql) {
+				c := sql[i]
+				i++
+				if c == '"' {
+					// "" is the standard-SQL escape for a literal double-quote inside
+					// a double-quoted identifier. Preserve it as a literal " inside
+					// the backtick identifier.
+					if i < len(sql) && sql[i] == '"' {
+						b.WriteByte('"')
+						i++
+					} else {
+						break // closing quote
+					}
+				} else {
+					b.WriteByte(c)
+				}
+			}
+			b.WriteByte('`')
+		default:
+			b.WriteByte(ch)
+			i++
+		}
+	}
+	return b.String()
+}
+
 // jsonArrowTextRE rewrites col->>'$.path' → json_unquote(json_extract(col, '$.path'))
 // Must be processed before jsonArrowRE to avoid a partial ->> match.
 var jsonArrowTextRE = regexp.MustCompile(`(?i)(\w+)\s*->>\s*('[^']*')`)
@@ -245,7 +313,7 @@ func (db *DB) Query(sql string, opts ...WriteOption) (rows []Row, retErr error) 
 		return execDMLReturning(target, dmlSQL, retCols, forceWipe)
 	}
 
-	mainSQL = rewriteFullOuterJoins(rewriteFilterAggregates(rewriteJSONOps(mainSQL)))
+	mainSQL = rewriteFullOuterJoins(rewriteFilterAggregates(rewriteJSONOps(rewriteDoubleQuotedIdents(mainSQL))))
 	mainSQL, winSpecs, err := extractWindowFuncs(mainSQL)
 	if err != nil {
 		return nil, err
@@ -331,7 +399,7 @@ func (db *DB) Exec(sql string, opts ...WriteOption) (retErr error) {
 	}
 	db = target
 	sql = mainSQL
-	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(sql))))
+	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(rewriteDoubleQuotedIdents(sql)))))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)

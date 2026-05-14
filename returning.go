@@ -279,7 +279,7 @@ func execDeleteReturning(db *DB, stmt *sqlparser.Delete) ([]Row, error) {
 // execDMLReturning parses a DML statement (INSERT / UPDATE / DELETE), executes
 // it, and returns the affected rows projected through the RETURNING column list.
 func execDMLReturning(db *DB, sql string, retCols string, forceWipeOnSchemaConflict bool) ([]Row, error) {
-	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(sql))))
+	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(rewriteDoubleQuotedIdents(sql)))))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)

@@ -1057,7 +1057,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 - No indexes. All queries do a full table scan.
 - No foreign key constraints. Model relations with JOINs.
-- MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression.
+- MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression. Standard-SQL / PostgreSQL double-quoted identifiers (`"name"`, `"type"`, …) are automatically rewritten to MySQL backtick-quoted identifiers, so PostgreSQL-style queries work without changes.
 
 ## Roadmap
 
@@ -1092,12 +1092,26 @@ Sketch out a data model and queries before committing to a real database schema.
 - **`IN (subquery)` full pipeline** — `IN` / `NOT IN` subqueries now support the complete SELECT pipeline inside: `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, and `UNION` / `UNION ALL`. Correlated references to the outer row work in all of these. ✓
 - **Value-based `RANGE` frames** — `RANGE BETWEEN N PRECEDING AND N FOLLOWING` (and all mixed combinations with `UNBOUNDED`) compares the numeric ORDER BY column value of each row rather than row offsets. Works with `int64`, `float64`, and `DESC` ordering. ✓
 - **`HAVING` aggregates not in `SELECT`** — `HAVING COUNT(*) > 1` now works even when `COUNT(*)` does not appear in the `SELECT` list, for both the main pipeline and all subquery paths. ✓
+- **Double-quoted identifier support** — `"name"`, `"type"`, `"status"` and all other standard-SQL / PostgreSQL double-quoted identifiers are transparently rewritten to MySQL backtick identifiers before parsing. ✓
 
 ### Remaining
 
 None — all roadmap items are complete.
 
 ## Changelog
+
+### 2026-05-14
+
+**Added**
+
+- **Double-quoted identifier support** — standard-SQL / PostgreSQL double-quoted identifiers (e.g. `"name"`, `"type"`, `"status"`, `"value"`) are now automatically translated to MySQL backtick-quoted identifiers before parsing. This means queries copied directly from PostgreSQL or any SQL editor that quotes identifiers work without modification. Single-quoted string literals containing `"` characters are left untouched. The `""` escape inside a double-quoted identifier is preserved as a literal `"`. No config needed — the rewrite is transparent and applies to all entry points: `Query`, `Exec`, `QueryNamed`, `ExecNamed`, and the `database/sql` driver.
+
+  ```sql
+  -- These are now all equivalent:
+  SELECT "name", "type" FROM "orders" WHERE "status" = 'open'
+  SELECT `name`, `type` FROM `orders` WHERE `status` = 'open'
+  SELECT  name,  type  FROM  orders  WHERE  status  = 'open'
+  ```
 
 ### 2026-05-12
 
