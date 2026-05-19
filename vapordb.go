@@ -107,6 +107,227 @@ func rewriteJSONOps(sql string) string {
 	return sql
 }
 
+// rewriteILIKE rewrites PostgreSQL ILIKE / NOT ILIKE to case-insensitive LIKE
+// comparisons that the MySQL-dialect parser understands:
+//
+//	col ILIKE 'pattern'     →  LOWER(col) LIKE LOWER('pattern')
+//	col NOT ILIKE 'pattern' →  LOWER(col) NOT LIKE LOWER('pattern')
+//
+// Both sides of the operator are wrapped in LOWER() so the comparison is truly
+// case-insensitive regardless of collation. Single-quoted string literals in
+// the input are skipped verbatim so occurrences of the word ILIKE inside a
+// string value are never touched.
+//
+// Left-hand operand may be a simple identifier, a qualified identifier
+// (table.column), a backtick-quoted identifier, or a parenthesised expression.
+// Right-hand operand may be a string literal, a parenthesised expression, or
+// a parameter placeholder (?, :name, $1).
+func rewriteILIKE(sql string) string {
+	if len(sql) < 5 {
+		return sql
+	}
+	upper := strings.ToUpper(sql)
+	if !strings.Contains(upper, "ILIKE") {
+		return sql
+	}
+
+	isWordChar := func(c byte) bool {
+		return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_'
+	}
+
+	type patch struct{ start, end int; repl string }
+	var patches []patch
+
+	n := len(sql)
+	i := 0
+
+	for i < n {
+		// Skip single-quoted string literals verbatim.
+		if sql[i] == '\'' {
+			i++
+			for i < n {
+				c := sql[i]
+				i++
+				if c == '\'' {
+					if i < n && sql[i] == '\'' {
+						i++ // '' escape sequence
+					} else {
+						break
+					}
+				}
+			}
+			continue
+		}
+
+		// Detect "ILIKE" token at a word boundary.
+		if i+5 > n || !strings.EqualFold(sql[i:i+5], "ILIKE") {
+			i++
+			continue
+		}
+		if i > 0 && isWordChar(sql[i-1]) { // not a word boundary on the left
+			i++
+			continue
+		}
+		if i+5 < n && isWordChar(sql[i+5]) { // not a word boundary on the right
+			i++
+			continue
+		}
+
+		ilikeStart := i
+		ilikeEnd := i + 5
+
+		// ── Scan backward for optional NOT and left operand ──────────────────
+
+		k := ilikeStart - 1
+		isWS := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+		for k >= 0 && isWS(sql[k]) {
+			k--
+		}
+		if k < 0 {
+			i++
+			continue
+		}
+
+		// Check for preceding NOT keyword.
+		notOp := false
+		if k >= 2 && strings.EqualFold(sql[k-2:k+1], "NOT") &&
+			(k-3 < 0 || !isWordChar(sql[k-3])) {
+			notOp = true
+			k -= 3
+			for k >= 0 && isWS(sql[k]) {
+				k--
+			}
+			if k < 0 {
+				i++
+				continue
+			}
+		}
+
+		// Find the left operand boundary.
+		leftEnd := k + 1 // exclusive
+		var leftStart int
+		switch {
+		case sql[k] == ')': // parenthesised expression
+			depth := 0
+			for k >= 0 {
+				if sql[k] == ')' {
+					depth++
+				} else if sql[k] == '(' {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+				k--
+			}
+			if k < 0 {
+				i++
+				continue
+			}
+			leftStart = k
+		case sql[k] == '`': // backtick-quoted identifier
+			k--
+			for k >= 0 && sql[k] != '`' {
+				k--
+			}
+			if k < 0 {
+				i++
+				continue
+			}
+			leftStart = k
+		case isWordChar(sql[k]) || sql[k] == '.':
+			for k >= 0 && (isWordChar(sql[k]) || sql[k] == '.') {
+				k--
+			}
+			leftStart = k + 1
+		default:
+			i++
+			continue
+		}
+
+		left := sql[leftStart:leftEnd]
+
+		// ── Scan forward for right operand ────────────────────────────────────
+
+		j := ilikeEnd
+		for j < n && isWS(sql[j]) {
+			j++
+		}
+		if j >= n {
+			i++
+			continue
+		}
+
+		rightStart := j
+		switch {
+		case sql[j] == '\'': // string literal
+			j++
+			for j < n {
+				c := sql[j]
+				j++
+				if c == '\'' {
+					if j < n && sql[j] == '\'' {
+						j++ // '' escape
+					} else {
+						break
+					}
+				}
+			}
+		case sql[j] == '(': // parenthesised expression
+			depth := 0
+			for j < n {
+				if sql[j] == '(' {
+					depth++
+				} else if sql[j] == ')' {
+					depth--
+					if depth == 0 {
+						j++
+						break
+					}
+				}
+				j++
+			}
+		case sql[j] == '?': // anonymous placeholder
+			j++
+		case sql[j] == ':' || sql[j] == '$' || isWordChar(sql[j]): // :name / $1 / identifier
+			for j < n && (isWordChar(sql[j]) || sql[j] == ':' || sql[j] == '$') {
+				j++
+			}
+		default:
+			i++
+			continue
+		}
+
+		right := sql[rightStart:j]
+
+		var repl string
+		if notOp {
+			repl = "LOWER(" + left + ") NOT LIKE LOWER(" + right + ")"
+		} else {
+			repl = "LOWER(" + left + ") LIKE LOWER(" + right + ")"
+		}
+
+		patches = append(patches, patch{leftStart, j, repl})
+		i = j // advance past the whole expression
+	}
+
+	if len(patches) == 0 {
+		return sql
+	}
+
+	var b strings.Builder
+	b.Grow(len(sql) + len(patches)*20)
+	pos := 0
+	for _, p := range patches {
+		b.WriteString(sql[pos:p.start])
+		b.WriteString(p.repl)
+		pos = p.end
+	}
+	b.WriteString(sql[pos:])
+	return b.String()
+}
+
 // fullOuterRE matches FULL [OUTER] JOIN (case-insensitive) at word boundaries.
 var fullOuterRE = regexp.MustCompile(`(?i)\bFULL\s+(?:OUTER\s+)?JOIN\b`)
 
@@ -313,7 +534,7 @@ func (db *DB) Query(sql string, opts ...WriteOption) (rows []Row, retErr error) 
 		return execDMLReturning(target, dmlSQL, retCols, forceWipe)
 	}
 
-	mainSQL = rewriteFullOuterJoins(rewriteFilterAggregates(rewriteJSONOps(rewriteDoubleQuotedIdents(mainSQL))))
+	mainSQL = rewriteFullOuterJoins(rewriteFilterAggregates(rewriteILIKE(rewriteJSONOps(rewriteDoubleQuotedIdents(mainSQL)))))
 	mainSQL, winSpecs, err := extractWindowFuncs(mainSQL)
 	if err != nil {
 		return nil, err
@@ -399,7 +620,7 @@ func (db *DB) Exec(sql string, opts ...WriteOption) (retErr error) {
 	}
 	db = target
 	sql = mainSQL
-	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteJSONOps(rewriteDoubleQuotedIdents(sql)))))
+	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteILIKE(rewriteJSONOps(rewriteDoubleQuotedIdents(sql))))))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)

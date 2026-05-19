@@ -1057,7 +1057,7 @@ Sketch out a data model and queries before committing to a real database schema.
 
 - No indexes. All queries do a full table scan.
 - No foreign key constraints. Model relations with JOINs.
-- MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression. Standard-SQL / PostgreSQL double-quoted identifiers (`"name"`, `"type"`, …) are automatically rewritten to MySQL backtick-quoted identifiers, so PostgreSQL-style queries work without changes.
+- MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression. Standard-SQL / PostgreSQL double-quoted identifiers (`"name"`, `"type"`, …) are automatically rewritten to backtick identifiers, and `ILIKE` / `NOT ILIKE` are rewritten to `LOWER(x) LIKE LOWER(y)`, so PostgreSQL-style queries work without changes.
 
 ## Roadmap
 
@@ -1093,12 +1093,25 @@ Sketch out a data model and queries before committing to a real database schema.
 - **Value-based `RANGE` frames** — `RANGE BETWEEN N PRECEDING AND N FOLLOWING` (and all mixed combinations with `UNBOUNDED`) compares the numeric ORDER BY column value of each row rather than row offsets. Works with `int64`, `float64`, and `DESC` ordering. ✓
 - **`HAVING` aggregates not in `SELECT`** — `HAVING COUNT(*) > 1` now works even when `COUNT(*)` does not appear in the `SELECT` list, for both the main pipeline and all subquery paths. ✓
 - **Double-quoted identifier support** — `"name"`, `"type"`, `"status"` and all other standard-SQL / PostgreSQL double-quoted identifiers are transparently rewritten to MySQL backtick identifiers before parsing. ✓
+- **`ILIKE` / `NOT ILIKE`** — case-insensitive `LIKE`; rewritten to `LOWER(x) LIKE LOWER(y)` before parsing. ✓
 
 ### Remaining
 
 None — all roadmap items are complete.
 
 ## Changelog
+
+### 2026-05-19
+
+**Added**
+
+- **`ILIKE` / `NOT ILIKE`** — PostgreSQL case-insensitive pattern matching is now supported. `col ILIKE '%foo%'` is transparently rewritten to `LOWER(col) LIKE LOWER('%foo%')` before parsing, so both sides of the comparison are lowercased. `NOT ILIKE` works the same way. Supports simple identifiers, qualified identifiers (`t.col`), backtick-quoted identifiers, named parameters (`:pat`), and positional placeholders (`?`, `$1`). String literals that happen to contain the word `ILIKE` are never touched. Regular case-sensitive `LIKE` is completely unaffected.
+
+  ```sql
+  SELECT * FROM users WHERE name ILIKE '%alice%'
+  SELECT * FROM orders WHERE status NOT ILIKE 'cancel%'
+  SELECT * FROM t WHERE t.email ILIKE :emailPat
+  ```
 
 ### 2026-05-14
 
