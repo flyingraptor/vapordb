@@ -36,7 +36,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 - **Enum constraints.** `db.DeclareEnum(table, col, vals...)` restricts a column to a declared set of string values. INSERTs and UPDATEs that supply a value outside the set are rejected with an error. Calling `DeclareEnum` again on the same column widens the set (new variants are added; existing ones are never removed). NULL is always accepted. Constraints survive `Save` / `Load`.
 - **Schema locking.** `db.LockTable(name)` / `db.LockSchema()` freeze a table's schema. Any INSERT that would add a new column, widen a type, or trigger an unsafe type change is rejected with an error. `db.UnlockTable` / `db.UnlockSchema` re-enable evolution. Lock state persists through `Save` / `Load`.
 - **Query log.** After the first `db.Save("db.json")` or `db.Load("db.json")`, every `Exec` and `Query` call is automatically appended to a companion `db_queries.jsonl` file (JSON Lines). Each entry records the timestamp, operation, SQL, duration in ms, row count, and any error. Zero setup — the log starts automatically alongside the snapshot.
-- **Optional persistence.** Save the entire database to a JSON file and reload it later.
+- **Optional persistence.** Save the entire database to a JSON file and reload it later, or stream to/from any `io.Writer` / `io.Reader` with `db.SaveTo` / `db.LoadFrom`.
 - **Transactions.** `db.Begin()` returns a `*Tx` with the same `Exec` / `Query` API. `tx.Commit()` makes all changes permanent; `tx.Rollback()` restores the database to the state it was in when `Begin` was called (copy-on-write snapshot per table).
 - **`database/sql` driver.** Import `_ "github.com/flyingraptor/vapordb/driver"` and call `driver.Register(name, db)` to expose any `*DB` as a standard `*sql.DB`. Works with sqlx, bun, goqu, and any library that speaks `database/sql`. Positional `?` and `$N` parameter styles are supported.
 - **DDL generation.** `db.GenerateDDL("mysql")` / `db.GenerateDDL("postgres")` emits `CREATE TABLE` DDL for the live schema, ready to paste into a real database.
@@ -84,6 +84,8 @@ func main() {
 | `db.Query(sql)` | Run SELECT, returns `[]Row` |
 | `db.Save(path)` | Persist the database to a JSON file |
 | `db.Load(path)` | Load a previously saved JSON file |
+| `db.SaveTo(w)` | Persist the database as JSON to any `io.Writer` |
+| `db.LoadFrom(r)` | Load the database from JSON on any `io.Reader` |
 | `db.InsertStruct(table, v)` | Insert a struct using `db` field tags |
 | `vapordb.ScanRows[T](rows)` | Scan `[]Row` into a typed slice |
 | `db.QueryNamed(sql, params)` | SELECT with named `:param` placeholders |
@@ -302,6 +304,26 @@ if err := db.Load("/var/data/myapp.json"); err != nil && !errors.Is(err, os.ErrN
 ```
 
 The JSON file contains the full schema and all rows for every table.
+
+For streaming or non-file destinations, use `SaveTo(io.Writer)` and `LoadFrom(io.Reader)` — handy for `http` bodies, `gzip` streams, `bytes.Buffer`, S3 objects, or embedded `fs.FS` snapshots:
+
+```go
+// save to any writer (e.g. a gzip stream)
+f, _ := os.Create("/var/data/myapp.json.gz")
+defer f.Close()
+zw := gzip.NewWriter(f)
+defer zw.Close()
+db.SaveTo(zw)
+
+// load from any reader (e.g. an embedded snapshot)
+zr, _ := gzip.NewReader(embedded)
+db := vapordb.New()
+if err := db.LoadFrom(zr); err != nil {
+    log.Fatal(err)
+}
+```
+
+Unlike `Save` / `Load`, the `io`-based variants have no associated file path, so they do **not** enable the companion query log.
 
 ## SQL Reference
 
@@ -1094,12 +1116,32 @@ Sketch out a data model and queries before committing to a real database schema.
 - **`HAVING` aggregates not in `SELECT`** — `HAVING COUNT(*) > 1` now works even when `COUNT(*)` does not appear in the `SELECT` list, for both the main pipeline and all subquery paths. ✓
 - **Double-quoted identifier support** — `"name"`, `"type"`, `"status"` and all other standard-SQL / PostgreSQL double-quoted identifiers are transparently rewritten to MySQL backtick identifiers before parsing. ✓
 - **`ILIKE` / `NOT ILIKE`** — case-insensitive `LIKE`; rewritten to `LOWER(x) LIKE LOWER(y)` before parsing. ✓
+- **Streaming persistence** — `db.SaveTo(io.Writer)` / `db.LoadFrom(io.Reader)` persist to and restore from any stream (gzip, HTTP body, `bytes.Buffer`, embedded `fs.FS`), complementing the file-based `Save` / `Load`. ✓
 
 ### Remaining
 
 None — all roadmap items are complete.
 
 ## Changelog
+
+### 2026-06-10
+
+**Added**
+
+- **Streaming persistence** — two new `io`-based methods complement the file-based `Save` / `Load`:
+
+  - `db.SaveTo(w io.Writer)` — serialise the whole database as JSON to any writer.
+  - `db.LoadFrom(r io.Reader)` — restore the database from JSON on any reader (reads to EOF).
+
+  These make it trivial to persist to gzip streams, HTTP request/response bodies, `bytes.Buffer`, S3 objects, or embedded `fs.FS` snapshots. Unlike `Save` / `Load`, the streaming variants have no associated file path and therefore do not enable the companion query log.
+
+  ```go
+  var buf bytes.Buffer
+  db.SaveTo(&buf)
+
+  db2 := vapordb.New()
+  db2.LoadFrom(&buf)
+  ```
 
 ### 2026-05-19
 

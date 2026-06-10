@@ -1,6 +1,7 @@
 package vapordb
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"testing"
@@ -326,6 +327,29 @@ func TestSaveLoad(t *testing.T) {
 	}
 
 	_ = os.Remove(path)
+}
+
+func TestSaveToLoadFrom(t *testing.T) {
+	db := New()
+	mustExec(t, db, `INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)`)
+	mustExec(t, db, `INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)`)
+
+	var buf bytes.Buffer
+	if err := db.SaveTo(&buf); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	db2 := New()
+	if err := db2.LoadFrom(&buf); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	rows := mustQuery(t, db2, `SELECT name FROM users ORDER BY id ASC`)
+	if len(rows) != 2 || rows[0]["name"] != strVal("Alice") || rows[1]["name"] != strVal("Bob") {
+		t.Errorf("loaded data mismatch: %v", rows)
+	}
+	if db2.Tables["users"].Schema["age"] != KindInt {
+		t.Errorf("expected KindInt for age schema after LoadFrom")
+	}
 }
 
 // ─── DISTINCT ────────────────────────────────────────────────────────────────

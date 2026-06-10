@@ -5,6 +5,7 @@ package vapordb
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -669,16 +670,64 @@ func (db *DB) Save(path string) error {
 	return nil
 }
 
+// SaveTo serialises the entire database as JSON to w. It is the streaming
+// counterpart to [DB.Save].
+//
+// Unlike [DB.Save], SaveTo has no associated file path, so it does not enable
+// the companion query log.
+func (db *DB) SaveTo(w io.Writer) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	data, err := json.MarshalIndent(dbState{Tables: db.Tables}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	if _, err := w.Write(data); err != nil {
+		return fmt.Errorf("write: %w", err)
+	}
+	return nil
+}
+
 // Load restores the database from a JSON file previously created by Save.
 // Like Save, it enables the query log at the companion path.
 func (db *DB) Load(path string) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", path, err)
 	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := db.loadBytes(data); err != nil {
+		return err
+	}
+	lp := logPathFor(path)
+	db.logPath.Store(&lp)
+	return nil
+}
+
+// LoadFrom restores the database from JSON read from r. The JSON must have been
+// produced by [DB.Save] (or [DB.SaveTo]).
+//
+// Unlike [DB.Load], LoadFrom has no associated file path, so it does not enable
+// the companion query log. Reads continue until r returns io.EOF.
+func (db *DB) LoadFrom(r io.Reader) error {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return fmt.Errorf("read: %w", err)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	return db.loadBytes(data)
+}
+
+// loadBytes decodes the database state from data and installs it.
+// Callers must hold db.mu.
+func (db *DB) loadBytes(data []byte) error {
 	var state dbState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return fmt.Errorf("unmarshal: %w", err)
@@ -687,7 +736,5 @@ func (db *DB) Load(path string) error {
 	if db.Tables == nil {
 		db.Tables = make(map[string]*Table)
 	}
-	lp := logPathFor(path)
-	db.logPath.Store(&lp)
 	return nil
 }
