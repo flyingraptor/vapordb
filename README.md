@@ -21,7 +21,7 @@ rows, _ := db.Query(`SELECT name FROM users WHERE age > 25`)
 
 - **Zero setup.** No CREATE TABLE, no migrations. Schema is inferred from the first INSERT.
 - **Automatic schema evolution.** New columns are added on the fly. Safe type widening (e.g. `int` to `float`) happens automatically.
-- **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, INNER / LEFT / RIGHT / FULL OUTER JOIN, GROUP BY, ORDER BY, LIMIT, HAVING.
+- **SQL you already know.** SELECT, INSERT, UPDATE, DELETE with WHERE, INNER / LEFT / RIGHT / FULL OUTER JOIN, GROUP BY, ORDER BY, LIMIT, HAVING. `INSERT … SELECT` populates a table from a query in one statement.
 - **Rich expressions.** Aggregates, scalar functions, CASE, BETWEEN, IN, LIKE (including `ESCAPE`), `CAST` / `CONVERT`, string concat with `||` (PostgreSQL-style when a string operand is involved; otherwise boolean OR), arithmetic, and more.
 - **UPSERT.** `ON CONFLICT (col) DO UPDATE SET …` and `ON CONFLICT (col) DO NOTHING`. Composite conflict keys and batch-value inserts are supported. Combine with `RETURNING` on the same `INSERT` to read inserted or updated rows.
 - **Window functions.** `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `NTILE`, `CUME_DIST`, `PERCENT_RANK` with `OVER([PARTITION BY …] [ORDER BY …] [frame])`. ROWS and RANGE frames supported. Outer `LIMIT` / `OFFSET` are applied *after* window results so aggregates such as `COUNT(*) OVER()` see the full row set.
@@ -492,6 +492,50 @@ UPDATE users SET age = 31 WHERE name = 'Alice'
 DELETE FROM users WHERE age < 18
 ```
 
+### INSERT … SELECT
+
+Populate a table from the result of a query in a single statement. The SELECT's
+output columns are mapped onto the target column list **positionally** (the
+first selected column fills the first target column, and so on), so the names do
+not have to match.
+
+```sql
+-- Copy / transform rows between tables
+INSERT INTO archived_users (id, name)
+SELECT id, name FROM users WHERE active = false
+
+-- Computed expressions and constant literals are fine
+INSERT INTO line_totals (order_id, total, source)
+SELECT order_id, price * qty, 'import' FROM order_lines
+
+-- The full SELECT pipeline is available: JOIN, GROUP BY, DISTINCT, ORDER BY,
+-- LIMIT, derived tables, and UNION.
+INSERT INTO region_totals (region, total)
+SELECT region, SUM(amount) AS total FROM sales GROUP BY region
+
+-- Composes with ON CONFLICT … and RETURNING
+db.Query(`
+  INSERT INTO items (sku, name)
+  SELECT sku, name FROM catalogue WHERE in_stock
+  ON CONFLICT (sku) DO UPDATE SET name = EXCLUDED.name
+  RETURNING sku, name`)
+```
+
+It also works with `FULL OUTER JOIN`, correlated and scalar subqueries, named
+parameters, and CTEs (`WITH cte AS (…) INSERT INTO t (…) SELECT … FROM cte`).
+
+Two rules keep the positional mapping unambiguous: the INSERT needs an explicit
+target column list, and the SELECT must name each output column (a bare `*` is
+rejected, because rows are stored as unordered maps). Two projected columns that
+resolve to the same name must be disambiguated with `AS`. For a `UNION` source,
+every branch must project the same ordered output names (alias them with `AS` if
+they differ) — a mismatch is reported as an error rather than silently inserting
+NULLs.
+
+> **Not yet supported:** window functions in the projection of an
+> `INSERT … SELECT` (e.g. `INSERT INTO t (id, rn) SELECT id, ROW_NUMBER() OVER (…) FROM s`).
+> Compute the window result in a CTE first and `INSERT … SELECT` from the CTE.
+
 ### RETURNING
 
 Append a `RETURNING` clause to `INSERT`, `UPDATE`, `DELETE`, or an **`INSERT … ON CONFLICT …`** upsert and call `db.Query` to get the affected rows back.
@@ -619,7 +663,7 @@ SELECT id, score,
 FROM results
 ```
 
-RANGE supports `UNBOUNDED PRECEDING`, `CURRENT ROW`, and `UNBOUNDED FOLLOWING` as bounds. RANGE with `N PRECEDING` / `N FOLLOWING` is not yet supported.
+RANGE supports `UNBOUNDED PRECEDING`, `CURRENT ROW`, and `UNBOUNDED FOLLOWING` as bounds, as well as value-based `N PRECEDING` / `N FOLLOWING` (the frame includes peer rows whose numeric ORDER BY value is within ±N of the current row; `int64`, `float64`, and `DESC` ordering are handled).
 
 #### Offset Functions — LAG / LEAD
 
@@ -1117,12 +1161,49 @@ Sketch out a data model and queries before committing to a real database schema.
 - **Double-quoted identifier support** — `"name"`, `"type"`, `"status"` and all other standard-SQL / PostgreSQL double-quoted identifiers are transparently rewritten to MySQL backtick identifiers before parsing. ✓
 - **`ILIKE` / `NOT ILIKE`** — case-insensitive `LIKE`; rewritten to `LOWER(x) LIKE LOWER(y)` before parsing. ✓
 - **Streaming persistence** — `db.SaveTo(io.Writer)` / `db.LoadFrom(io.Reader)` persist to and restore from any stream (gzip, HTTP body, `bytes.Buffer`, embedded `fs.FS`), complementing the file-based `Save` / `Load`. ✓
+- **`INSERT … SELECT`** — populate a table from a query in one statement. Source columns map onto the target list positionally and the full SELECT pipeline (`WHERE` / `JOIN` incl. `FULL OUTER JOIN` / `GROUP BY` / `DISTINCT` / `ORDER BY` / `LIMIT` / derived tables / `UNION` / correlated + scalar subqueries) is available. Composes with `ON CONFLICT …`, `RETURNING`, named parameters, and CTEs (`WITH … INSERT … SELECT`). Window functions in the projection are the one unsupported case — compute them in a CTE first. (This work also fixed a latent panic where any `WITH … <DML>` through `db.Exec` unlocked the wrong mutex and deadlocked the database.) ✓
 
 ### Remaining
 
-None — all roadmap items are complete.
+- **Window functions inside `INSERT … SELECT`** — window expressions (e.g. `ROW_NUMBER() OVER (…)`, `LAG`, `SUM(…) OVER (…)`) in the projection of an `INSERT … SELECT` are not yet supported, because window extraction is only wired into the `Query` / SELECT path, not the `Exec` / `RETURNING` INSERT paths. Workaround: compute the window result in a CTE and `INSERT … SELECT` from it:
+
+  ```sql
+  WITH ranked AS (SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM src)
+  INSERT INTO dst (id, rn) SELECT id, rn FROM ranked
+  ```
+
+- **`INSERT` without an explicit column list** — `INSERT INTO t VALUES (…)` and `INSERT INTO t SELECT …` are rejected; a column list is required (`INSERT INTO t (a, b) …`). The schema is an unordered map, so there is no positional column order to map bare value tuples onto.
+
+- **Scalar subquery with `UNION`** — a scalar subquery used where a single value is expected, e.g. `WHERE x = (SELECT … UNION SELECT …)`, is rejected. Scalar subqueries must be a single `SELECT` returning one column. (Uncorrelated `IN (… UNION …)` and `FROM (… UNION …)` are fine; this only affects the scalar-value position.)
+
+- **`WITH RECURSIVE`** — recursive CTEs are not supported. Non-recursive `WITH` works (it is pre-processed into ordinary virtual tables).
+
+- **Function calls / parentheses in a partial `ON CONFLICT` predicate** — `ON CONFLICT (cols) WHERE predicate DO …` strips the predicate, but the predicate must not contain parentheses or function calls (the rewrite regex stops at the first `(`). Plain column predicates such as `WHERE deleted_at IS NULL` work.
+
+- **Multi-table `UPDATE` / `DELETE`** — `UPDATE`/`DELETE` operate on a single table; join-based multi-table updates/deletes are not supported.
 
 ## Changelog
+
+### 2026-06-26
+
+**Added**
+
+- **`INSERT … SELECT`** — a table can now be populated from the result of a query in a single statement, instead of a pre-SELECT plus an N-row upsert loop. The SELECT's output columns map onto the INSERT target list **positionally** (names need not match), and the full SELECT pipeline is available: `WHERE`, `JOIN` (including `FULL OUTER JOIN`), `GROUP BY`, `DISTINCT`, `ORDER BY`, `LIMIT`, derived tables, `UNION` / `UNION ALL`, and correlated / scalar subqueries. It composes with `ON CONFLICT … DO NOTHING | DO UPDATE`, `RETURNING`, named parameters, and CTEs (`WITH … INSERT … SELECT`).
+
+  ```sql
+  INSERT INTO items (sku, name)
+  SELECT sku, name FROM catalogue WHERE in_stock
+  ON CONFLICT (sku) DO UPDATE SET name = EXCLUDED.name
+  RETURNING sku, name
+  ```
+
+  The INSERT needs an explicit target column list and the SELECT must name each output column (a bare `*` is rejected because rows are unordered maps); two projected columns resolving to the same name must be aliased with `AS`. For a `UNION` source every branch must project the same ordered output names — a mismatch is reported as an error rather than silently inserting NULLs. Window functions in the projection are the one unsupported case (see Roadmap → Remaining).
+
+**Fixed**
+
+- **`WITH … <DML>` through `db.Exec` panicked and deadlocked the database** — `Exec` rebound its `db` variable to the temporary CTE database after `resolveCTEs`, so the deferred unlock released the *temp* DB's mutex (`panic: sync: Unlock of unlocked RWMutex`) while leaving the *real* DB's write lock held forever, hanging every subsequent call. `Exec` now executes against the temp DB without rebinding, so the deferred unlock always targets the lock that is actually held. This affected any CTE-prefixed statement run through `Exec`, independent of `INSERT … SELECT`.
+- **`WITH … INSERT INTO <new table> SELECT …` silently lost its rows** — tables newly created by the main statement were written only to the throwaway CTE database and never propagated back. A new `commitCTEWrites` step now copies main-statement tables back into the real database after the write, while skipping the transient CTE tables so they never leak in as real tables.
+- **`FULL OUTER JOIN` was rejected by `Exec` / `RETURNING`** — `rewriteFullOuterJoins` previously ran only in the `Query` SELECT path. It is now applied in the `Exec` and `RETURNING` rewrite chains too, so `FULL OUTER JOIN` works as an `INSERT … SELECT` source.
 
 ### 2026-06-10
 

@@ -302,17 +302,16 @@ func execUnionNode(db *DB, stmt *sqlparser.Union) ([]Row, error) {
 //   - conflictCols non-nil + stmt.OnDup non-nil  →  update existing row on match
 //   - conflictCols non-nil + doNothing true       →  skip insert on conflict
 //
+// The insert source may be a VALUES list or a SELECT/UNION (INSERT … SELECT);
+// see insertSourceRows for how each source is materialised into target rows.
+//
 // When affectedRowIdx is non-nil, each inserted or upsert-updated row's table
-// index is appended (in VALUES order), so INSERT … RETURNING can include
+// index is appended (in source-row order), so INSERT … RETURNING can include
 // ON CONFLICT DO UPDATE results. DO NOTHING conflicts append nothing. Skipped
 // when nil (e.g. plain Exec).
 func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing bool, forceWipeOnSchemaConflict bool, trackSchemaWipe *bool, affectedRowIdx *[]int, upsertWhere string) error {
 	tableName := stmt.Table.Name.String()
 
-	values, ok := stmt.Rows.(sqlparser.Values)
-	if !ok {
-		return fmt.Errorf("only VALUES inserts are supported")
-	}
 	if len(stmt.Columns) == 0 {
 		return fmt.Errorf("INSERT requires an explicit column list")
 	}
@@ -322,20 +321,15 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 		cols[i] = c.Lowered()
 	}
 
-	for _, valTuple := range values {
-		if len(valTuple) != len(cols) {
-			return fmt.Errorf("column/value count mismatch: %d columns vs %d values",
-				len(cols), len(valTuple))
-		}
-		row := make(Row, len(cols))
-		for i, expr := range valTuple {
-			val, err := evalExpr(db, expr, Row{})
-			if err != nil {
-				return fmt.Errorf("evaluating value for column %q: %w", cols[i], err)
-			}
-			row[cols[i]] = val
-		}
+	// Build the incoming rows from either a VALUES list or a SELECT/UNION
+	// source (INSERT … SELECT). The SELECT is materialised up front so that
+	// reading from and writing to the same table in one statement is safe.
+	incoming, err := insertSourceRows(db, stmt, cols)
+	if err != nil {
+		return err
+	}
 
+	for _, row := range incoming {
 		// Validate enum constraints before touching the schema.
 		if existing := db.Tables[tableName]; existing != nil {
 			if err := validateEnum(existing, row); err != nil {
@@ -404,6 +398,144 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 		}
 	}
 	return nil
+}
+
+// insertSourceRows materialises the rows an INSERT will apply, from either a
+// VALUES list or a SELECT/UNION source (INSERT … SELECT). Each returned Row is
+// keyed by the INSERT's target column list (cols). For a SELECT source the
+// SELECT's output columns are mapped positionally onto cols.
+func insertSourceRows(db *DB, stmt *sqlparser.Insert, cols []string) ([]Row, error) {
+	switch src := stmt.Rows.(type) {
+	case sqlparser.Values:
+		rows := make([]Row, 0, len(src))
+		for _, valTuple := range src {
+			if len(valTuple) != len(cols) {
+				return nil, fmt.Errorf("column/value count mismatch: %d columns vs %d values",
+					len(cols), len(valTuple))
+			}
+			row := make(Row, len(cols))
+			for i, expr := range valTuple {
+				val, err := evalExpr(db, expr, Row{})
+				if err != nil {
+					return nil, fmt.Errorf("evaluating value for column %q: %w", cols[i], err)
+				}
+				row[cols[i]] = val
+			}
+			rows = append(rows, row)
+		}
+		return rows, nil
+
+	case sqlparser.SelectStatement:
+		return insertSelectRows(db, src, cols)
+
+	default:
+		return nil, fmt.Errorf("unsupported INSERT source type: %T", stmt.Rows)
+	}
+}
+
+// insertSelectRows runs a SELECT/UNION source and maps each result row onto the
+// INSERT target columns positionally: target column i receives the value of the
+// SELECT's i-th output column. The SELECT must project an explicit column list
+// (no bare "*" / "tbl.*") so that output columns are ordered and countable, and
+// the output-column count must match the target-column count.
+func insertSelectRows(db *DB, sel sqlparser.SelectStatement, cols []string) ([]Row, error) {
+	names, err := selectOutputColumns(sel)
+	if err != nil {
+		return nil, err
+	}
+	if len(names) != len(cols) {
+		return nil, fmt.Errorf("column/value count mismatch: %d columns vs %d selected columns",
+			len(cols), len(names))
+	}
+	// Reject duplicate output names: the row representation is a map, so two
+	// columns that resolve to the same output key cannot be read back
+	// positionally without data loss. Ask the user to disambiguate with AS.
+	seen := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		if _, dup := seen[n]; dup {
+			return nil, fmt.Errorf("INSERT … SELECT: duplicate output column %q; add an alias (AS …) to disambiguate", n)
+		}
+		seen[n] = struct{}{}
+	}
+
+	resultRows, err := execSelectStatement(db, asStatement(sel))
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Row, 0, len(resultRows))
+	for _, rr := range resultRows {
+		row := make(Row, len(cols))
+		for i, target := range cols {
+			if v, ok := rr[names[i]]; ok {
+				row[target] = v
+			} else {
+				row[target] = Null
+			}
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+// asStatement unwraps a ParenSelect to the concrete SELECT/UNION statement that
+// execSelectStatement understands.
+func asStatement(sel sqlparser.SelectStatement) sqlparser.Statement {
+	if ps, ok := sel.(*sqlparser.ParenSelect); ok {
+		return asStatement(ps.Select)
+	}
+	return sel
+}
+
+// selectOutputColumns returns the ordered output-column names of a SELECT/UNION
+// source, derived from its projection list using the same naming rule as
+// projectRow (so the names match the keys present in the executed result rows).
+// A UNION takes its column names from the left-most SELECT, matching SQL
+// semantics. Bare "*" / "tbl.*" projections are rejected because the row
+// representation is an unordered map, so a deterministic positional mapping is
+// not possible.
+func selectOutputColumns(sel sqlparser.SelectStatement) ([]string, error) {
+	switch s := sel.(type) {
+	case *sqlparser.Select:
+		names := make([]string, 0, len(s.SelectExprs))
+		for _, se := range s.SelectExprs {
+			ae, ok := se.(*sqlparser.AliasedExpr)
+			if !ok {
+				return nil, fmt.Errorf("INSERT … SELECT requires an explicit column list in the SELECT; '*' is not supported, name each column instead")
+			}
+			names = append(names, outputKey(ae))
+		}
+		if len(names) == 0 {
+			return nil, fmt.Errorf("INSERT … SELECT: the SELECT has no output columns")
+		}
+		return names, nil
+	case *sqlparser.Union:
+		// Every UNION branch must project the same ordered output names so the
+		// positional mapping is unambiguous: result rows are keyed by each
+		// branch's own output names, so divergent names would silently insert
+		// NULLs for the mismatched branch. Require explicit AS aliases instead.
+		left, err := selectOutputColumns(s.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := selectOutputColumns(s.Right)
+		if err != nil {
+			return nil, err
+		}
+		if len(left) != len(right) {
+			return nil, fmt.Errorf("INSERT … SELECT: UNION branches project different column counts (%d vs %d)", len(left), len(right))
+		}
+		for i := range left {
+			if left[i] != right[i] {
+				return nil, fmt.Errorf("INSERT … SELECT: UNION branches have mismatched output column %q vs %q; give both the same name with AS", left[i], right[i])
+			}
+		}
+		return left, nil
+	case *sqlparser.ParenSelect:
+		return selectOutputColumns(s.Select)
+	default:
+		return nil, fmt.Errorf("INSERT … SELECT: unsupported SELECT type %T", sel)
+	}
 }
 
 // findConflict returns the index of the first row in tbl whose values for all

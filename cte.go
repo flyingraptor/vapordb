@@ -114,13 +114,15 @@ func parseCTEs(sql string) (ctes []cteRef, mainQuery string, ok bool) {
 
 // resolveCTEs detects a WITH clause in sql, executes each CTE subquery in
 // order against a shallow DB copy (so later CTEs can reference earlier ones),
-// and returns the augmented DB together with the main query string.
+// and returns the augmented DB together with the main query string and the set
+// of CTE (virtual-table) names.
 //
-// If no WITH clause is present the original db and sql are returned unchanged.
-func resolveCTEs(db *DB, sql string, forceWipeOnSchemaConflict bool) (*DB, string, error) {
+// If no WITH clause is present the original db, sql, and a nil name set are
+// returned unchanged.
+func resolveCTEs(db *DB, sql string, forceWipeOnSchemaConflict bool) (*DB, string, map[string]bool, error) {
 	ctes, mainQuery, hasCTE := parseCTEs(sql)
 	if !hasCTE {
-		return db, sql, nil
+		return db, sql, nil, nil
 	}
 
 	// Shallow copy: real tables are shared (read-only during CTE execution).
@@ -132,10 +134,11 @@ func resolveCTEs(db *DB, sql string, forceWipeOnSchemaConflict bool) (*DB, strin
 		tempDB.Tables[k] = v
 	}
 
+	cteNames := make(map[string]bool, len(ctes))
 	for _, cte := range ctes {
 		rows, err := tempDB.Query(cte.query)
 		if err != nil {
-			return nil, "", fmt.Errorf("CTE %q: %w", cte.name, err)
+			return nil, "", nil, fmt.Errorf("CTE %q: %w", cte.name, err)
 		}
 		// Build a Table from the result rows so normal table-lookup paths work.
 		tbl := &Table{Schema: make(map[string]Kind), Rows: rows}
@@ -147,9 +150,29 @@ func resolveCTEs(db *DB, sql string, forceWipeOnSchemaConflict bool) (*DB, strin
 			}
 		}
 		tempDB.Tables[cte.name] = tbl
+		cteNames[cte.name] = true
 	}
 
-	return tempDB, mainQuery, nil
+	return tempDB, mainQuery, cteNames, nil
+}
+
+// commitCTEWrites propagates tables from a CTE temp DB (target) back into the
+// real db after a write statement. Pre-existing tables already share the same
+// *Table pointer, so this is a no-op for them; it matters for tables newly
+// created by the main statement (e.g. WITH … INSERT INTO new_table SELECT …),
+// which would otherwise be stranded on the temp DB and silently lost. The
+// transient CTE tables themselves are skipped so they never leak into the real
+// database. When no CTE was used (target == db) this does nothing.
+func commitCTEWrites(db, target *DB, cteNames map[string]bool) {
+	if target == db {
+		return
+	}
+	for name, tbl := range target.Tables {
+		if cteNames[name] {
+			continue
+		}
+		db.Tables[name] = tbl
+	}
 }
 
 func cteSkipWS(s string, pos int) int {

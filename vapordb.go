@@ -525,14 +525,19 @@ func (db *DB) Query(sql string, opts ...WriteOption) (rows []Row, retErr error) 
 	}()
 
 	forceWipe := effectiveForceWipeOnSchemaConflict(db, opts)
-	target, mainSQL, err := resolveCTEs(db, sql, forceWipe)
+	target, mainSQL, cteNames, err := resolveCTEs(db, sql, forceWipe)
 	if err != nil {
 		return nil, err
 	}
 
 	// DML with RETURNING is handled before SELECT-only processing.
 	if dmlSQL, retCols, hasReturning := extractReturning(mainSQL); hasReturning {
-		return execDMLReturning(target, dmlSQL, retCols, forceWipe)
+		rows, err = execDMLReturning(target, dmlSQL, retCols, forceWipe)
+		if err != nil {
+			return nil, err
+		}
+		commitCTEWrites(db, target, cteNames)
+		return rows, nil
 	}
 
 	mainSQL = rewriteFullOuterJoins(rewriteFilterAggregates(rewriteILIKE(rewriteJSONOps(rewriteDoubleQuotedIdents(mainSQL)))))
@@ -615,33 +620,37 @@ func (db *DB) Exec(sql string, opts ...WriteOption) (retErr error) {
 	}()
 
 	forceWipe := effectiveForceWipeOnSchemaConflict(db, opts)
-	target, mainSQL, err := resolveCTEs(db, sql, forceWipe)
+	// resolveCTEs may return a temporary DB (target) augmented with CTE tables.
+	// Execute against target, but never rebind db: the deferred Unlock above is
+	// bound to the original db's lock, which is the one actually held.
+	target, mainSQL, cteNames, err := resolveCTEs(db, sql, forceWipe)
 	if err != nil {
 		return err
 	}
-	db = target
-	sql = mainSQL
-	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFilterAggregates(rewriteILIKE(rewriteJSONOps(rewriteDoubleQuotedIdents(sql))))))
+	rewritten, conflictCols, doNothing, upsertWhere := rewriteOnConflict(rewriteAnyAll(rewriteFullOuterJoins(rewriteFilterAggregates(rewriteILIKE(rewriteJSONOps(rewriteDoubleQuotedIdents(mainSQL)))))))
 	stmt, err := sqlparser.Parse(rewritten)
 	if err != nil {
 		return fmt.Errorf("parse error: %w", err)
 	}
 	switch s := stmt.(type) {
 	case *sqlparser.Insert:
-		return execInsert(db, s, conflictCols, doNothing, forceWipe, nil, nil, upsertWhere)
+		err = execInsert(target, s, conflictCols, doNothing, forceWipe, nil, nil, upsertWhere)
 	case *sqlparser.Update:
-		return execUpdate(db, s)
+		err = execUpdate(target, s)
 	case *sqlparser.Delete:
-		return execDelete(db, s)
+		err = execDelete(target, s)
 	case *sqlparser.Select:
-		_, err := execSelect(db, s)
-		return err
+		_, err = execSelect(target, s)
 	case *sqlparser.Union:
-		_, err := execUnion(db, s)
-		return err
+		_, err = execUnion(target, s)
 	default:
 		return fmt.Errorf("unsupported statement type: %T", stmt)
 	}
+	if err != nil {
+		return err
+	}
+	commitCTEWrites(db, target, cteNames)
+	return nil
 }
 
 // ─── PERSISTENCE ─────────────────────────────────────────────────────────────
