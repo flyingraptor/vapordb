@@ -452,3 +452,58 @@ func TestJoinStarExpansion(t *testing.T) {
 		t.Errorf("expected toy=ball, got %v", r["toy"])
 	}
 }
+
+// ─── mixed ON: equi-join + residual filter ───────────────────────────────────
+
+// An INNER JOIN whose ON combines an equi-join with a single-table filter must
+// return only the rows satisfying both. Exercises the hash join's residual
+// predicate path (the equi term is hashed; `p.views > 500` is the residual).
+func TestInnerJoinMixedOnFilter(t *testing.T) {
+	db := blogDB(t)
+
+	rows := mustQuery(t, db, `
+		SELECT a.name, p.title
+		FROM authors a
+		JOIN posts p ON a.id = p.author_id AND p.views > 500
+		ORDER BY p.id ASC
+	`)
+	// Only Alice's "Go Tips" (1000) clears the filter; "SQL Tricks" (500) and
+	// Bob's "UK Weather" (200) do not.
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d: %v", len(rows), rows)
+	}
+	if rows[0]["name"] != strVal("Alice") || rows[0]["title"] != strVal("Go Tips") {
+		t.Errorf("expected Alice/Go Tips, got %v", rows[0])
+	}
+}
+
+// A LEFT JOIN with a filter in the ON must keep unmatched left rows (null
+// padded) — the residual is part of the join condition, NOT a post-join WHERE.
+// This is the case where naively moving the ON filter to WHERE would be wrong:
+// it would drop Bob and Carol. The hash join applies the residual during
+// matching so outer-join semantics are preserved.
+func TestLeftJoinMixedOnKeepsUnmatched(t *testing.T) {
+	db := blogDB(t)
+
+	rows := mustQuery(t, db, `
+		SELECT a.name, p.title
+		FROM authors a
+		LEFT JOIN posts p ON a.id = p.author_id AND p.views > 500
+		ORDER BY a.id ASC, p.id ASC
+	`)
+	// Alice → Go Tips (1000 > 500). "SQL Tricks" (500) fails the residual.
+	// Bob → no post clears the filter → null-padded, but Bob is still present.
+	// Carol → no posts at all → null-padded.
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows (Alice matched, Bob & Carol null-padded), got %d: %v", len(rows), rows)
+	}
+	if rows[0]["name"] != strVal("Alice") || rows[0]["title"] != strVal("Go Tips") {
+		t.Errorf("row 0: expected Alice/Go Tips, got %v", rows[0])
+	}
+	if rows[1]["name"] != strVal("Bob") || rows[1]["title"].Kind != KindNull {
+		t.Errorf("row 1: expected Bob/NULL, got %v", rows[1])
+	}
+	if rows[2]["name"] != strVal("Carol") || rows[2]["title"].Kind != KindNull {
+		t.Errorf("row 2: expected Carol/NULL, got %v", rows[2])
+	}
+}

@@ -718,14 +718,22 @@ func nullRowLike(rows []Row) Row {
 func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 	rightRows := rowsForRef(db, jd.right, true)
 
-	// Fast path: for an equi-join (ON a = b [AND c = d …]) build a hash table on
-	// the right side and probe it from the left, turning the O(L×R) nested loop
-	// into O(L+R). Falls back to the nested loop for cross joins, non-equi
-	// conditions, empty inputs, or key types the hash cannot represent with the
-	// exact same equality semantics as Compare (dates, JSON, mixed families).
+	// Fast path: when the ON condition contains at least one equi-join term
+	// (a = b), build a hash table on the right side and probe it from the left,
+	// turning the O(L×R) nested loop into O(L+R). A mixed condition such as
+	// `a.id = b.a_id AND b.deleted_at IS NULL` is split into equi keys (used for
+	// hashing) plus a residual predicate applied only to the key-matched
+	// candidate pairs, so it stays O(N) too. Falls back to the nested loop for
+	// cross joins, purely non-equi conditions, empty inputs, or key types the
+	// hash cannot represent with Compare's exact equality semantics (dates,
+	// JSON, mixed numeric/string families).
 	if jd.condition != nil && len(leftRows) > 0 && len(rightRows) > 0 {
-		if keys, ok := equiJoinKeys(jd.condition, leftRows[0], rightRows[0], jd.right.alias); ok {
-			if result, done := hashJoin(db, leftRows, rightRows, jd, keys); done {
+		if keys, residual, ok := splitJoinCondition(jd.condition, leftRows[0], rightRows[0], jd.right.alias); ok {
+			result, done, err := hashJoin(db, leftRows, rightRows, jd, keys, residual)
+			if err != nil {
+				return nil, err
+			}
+			if done {
 				return result, nil
 			}
 		}
@@ -795,49 +803,70 @@ type joinKeyPair struct {
 	right *sqlparser.ColName
 }
 
-// equiJoinKeys inspects a join condition and, if it is a plain equi-join
-// (column = column, optionally AND-ed together), returns the key columns with
-// each side oriented to left/right rows. It returns ok=false for anything else
-// (OR, non-equality operators, function/arithmetic operands, or ambiguous
-// column orientation), so the caller falls back to the nested loop.
-func equiJoinKeys(cond sqlparser.Expr, leftSample, rightSample Row, rightAlias string) ([]joinKeyPair, bool) {
+// splitJoinCondition separates a join ON condition into equi-join key pairs
+// (col = col across the two inputs) and a residual predicate (every other
+// AND-ed term). The hash join hashes on the key pairs and applies the residual
+// only to the key-matched candidate pairs, so a mixed condition such as
+//
+//	a.id = b.a_id AND b.deleted_at IS NULL
+//
+// still runs in O(N): `a.id = b.a_id` becomes the hash key and
+// `b.deleted_at IS NULL` becomes the residual. Applying the residual during
+// matching (rather than as a post-join WHERE) preserves ON semantics for outer
+// joins, where a residual failure means the row is unmatched and gets
+// null-padded — not dropped.
+//
+// ok is false when there is no usable cross-side equi-join term (a pure
+// non-equi / OR / cross-table-filter condition), so the caller falls back to
+// the nested loop. Terms joined by OR are never split — an OR expression as a
+// whole becomes residual, and if it is the entire condition ok is false.
+func splitJoinCondition(cond sqlparser.Expr, leftSample, rightSample Row, rightAlias string) (keys []joinKeyPair, residual sqlparser.Expr, ok bool) {
 	switch e := cond.(type) {
 	case *sqlparser.ParenExpr:
-		return equiJoinKeys(e.Expr, leftSample, rightSample, rightAlias)
+		return splitJoinCondition(e.Expr, leftSample, rightSample, rightAlias)
 
 	case *sqlparser.AndExpr:
-		left, ok := equiJoinKeys(e.Left, leftSample, rightSample, rightAlias)
-		if !ok {
-			return nil, false
-		}
-		right, ok := equiJoinKeys(e.Right, leftSample, rightSample, rightAlias)
-		if !ok {
-			return nil, false
-		}
-		return append(left, right...), true
+		lk, lr, _ := splitJoinCondition(e.Left, leftSample, rightSample, rightAlias)
+		rk, rr, _ := splitJoinCondition(e.Right, leftSample, rightSample, rightAlias)
+		keys = append(lk, rk...)
+		residual = andExprs(lr, rr)
+		return keys, residual, len(keys) > 0
 
 	case *sqlparser.ComparisonExpr:
-		if e.Operator != sqlparser.EqualStr {
-			return nil, false
+		if e.Operator == sqlparser.EqualStr {
+			lcol, lok := e.Left.(*sqlparser.ColName)
+			rcol, rok := e.Right.(*sqlparser.ColName)
+			if lok && rok {
+				ls := colSide(lcol, leftSample, rightSample, rightAlias)
+				rs := colSide(rcol, leftSample, rightSample, rightAlias)
+				switch {
+				case ls == sideLeft && rs == sideRight:
+					return []joinKeyPair{{left: lcol, right: rcol}}, nil, true
+				case ls == sideRight && rs == sideLeft:
+					return []joinKeyPair{{left: rcol, right: lcol}}, nil, true
+				}
+			}
 		}
-		lcol, lok := e.Left.(*sqlparser.ColName)
-		rcol, rok := e.Right.(*sqlparser.ColName)
-		if !lok || !rok {
-			return nil, false
-		}
-		ls := colSide(lcol, leftSample, rightSample, rightAlias)
-		rs := colSide(rcol, leftSample, rightSample, rightAlias)
-		switch {
-		case ls == sideLeft && rs == sideRight:
-			return []joinKeyPair{{left: lcol, right: rcol}}, true
-		case ls == sideRight && rs == sideLeft:
-			return []joinKeyPair{{left: rcol, right: lcol}}, true
-		default:
-			return nil, false
-		}
+		// Any equality that is not a clean cross-side column pair (literal
+		// operand, same-side columns, function operands) is a residual predicate.
+		return nil, cond, false
 
 	default:
-		return nil, false
+		// Any other predicate (IS NULL, IN, BETWEEN, non-equi comparison, OR, …)
+		// is evaluated as a residual on the merged candidate rows.
+		return nil, cond, false
+	}
+}
+
+// andExprs combines two optional predicates with AND, dropping nil operands.
+func andExprs(a, b sqlparser.Expr) sqlparser.Expr {
+	switch {
+	case a == nil:
+		return b
+	case b == nil:
+		return a
+	default:
+		return &sqlparser.AndExpr{Left: a, Right: b}
 	}
 }
 
@@ -876,15 +905,20 @@ func colSide(c *sqlparser.ColName, leftSample, rightSample Row, rightAlias strin
 }
 
 // hashJoin performs an equi-join by hashing the right input and probing from
-// the left. It returns done=false (and a nil result) if it encounters a key
-// value it cannot represent with the same equality semantics as the nested
-// loop (KindDate / KindJSON, or a key position that mixes numeric and string
-// values across rows); the caller then falls back to nestedLoopJoin.
+// the left. When residual is non-nil it is evaluated on each key-matched
+// candidate pair (the merged row) and only pairs that satisfy it count as a
+// match — this keeps mixed ON conditions O(N) while preserving outer-join
+// null-padding semantics.
+//
+// It returns done=false (and a nil result) if it encounters a key value it
+// cannot represent with the same equality semantics as the nested loop
+// (KindDate / KindJSON, or a key position that mixes numeric and string values
+// across rows); the caller then falls back to nestedLoopJoin.
 //
 // Row output order matches the nested loop: left rows in order, each paired
 // with its matching right rows in right-row order, LEFT/FULL null-padding
 // interleaved per left row, and RIGHT/FULL null-padding appended at the end.
-func hashJoin(db *DB, leftRows, rightRows []Row, jd joinDesc, keys []joinKeyPair) ([]Row, bool) {
+func hashJoin(db *DB, leftRows, rightRows []Row, jd joinDesc, keys []joinKeyPair, residual sqlparser.Expr) ([]Row, bool, error) {
 	isLeft := strings.Contains(jd.joinType, "left")
 	isRight := strings.Contains(jd.joinType, "right")
 	isFull := jd.joinType == "full join"
@@ -899,7 +933,7 @@ func hashJoin(db *DB, leftRows, rightRows []Row, jd joinDesc, keys []joinKeyPair
 	for ri, rr := range rightRows {
 		key, matchable, supported := buildJoinKey(rr, keys, false, families)
 		if !supported {
-			return nil, false
+			return nil, false, nil
 		}
 		if !matchable {
 			continue // NULL key: never matches (unmatched for RIGHT/FULL padding)
@@ -913,12 +947,22 @@ func hashJoin(db *DB, leftRows, rightRows []Row, jd joinDesc, keys []joinKeyPair
 	for _, lr := range leftRows {
 		key, matchable, supported := buildJoinKey(lr, keys, true, families)
 		if !supported {
-			return nil, false
+			return nil, false, nil
 		}
 		matched := false
 		if matchable {
 			for _, ri := range index[key] {
-				result = append(result, mergeRows(lr, rightRows[ri]))
+				merged := mergeRows(lr, rightRows[ri])
+				if residual != nil {
+					pass, err := evalBoolWithDB(db, residual, merged)
+					if err != nil {
+						return nil, false, err
+					}
+					if !pass {
+						continue
+					}
+				}
+				result = append(result, merged)
 				rightMatched[ri] = true
 				matched = true
 			}
@@ -937,7 +981,7 @@ func hashJoin(db *DB, leftRows, rightRows []Row, jd joinDesc, keys []joinKeyPair
 		}
 	}
 
-	return result, true
+	return result, true, nil
 }
 
 type keyFamily int8

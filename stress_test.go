@@ -66,12 +66,27 @@ const countTwoTable = `
 	FROM order_items oi
 	JOIN shipments s ON oi.id = s.order_item_id`
 
+// countThreeTableMixedOn is a 3-table join whose middle ON carries a
+// single-table filter alongside the equi-join term (equi + residual). This is
+// the shape that previously fell back to the nested loop; the hash join now
+// splits it into an equi key plus a residual predicate and stays O(N).
+const countThreeTableMixedOn = `
+	SELECT COUNT(*) AS n
+	FROM orders o
+	JOIN order_items oi ON o.id = oi.order_id AND oi.active = true
+	JOIN shipments s ON oi.id = s.order_item_id
+	WHERE o.region_id = 1`
+
 func TestThreeTableJoinScaling(t *testing.T) {
 	assertLinearScaling(t, "3-table join", countThreeTable)
 }
 
 func TestTwoTableJoinScaling(t *testing.T) {
 	assertLinearScaling(t, "2-table join", countTwoTable)
+}
+
+func TestMixedOnJoinScaling(t *testing.T) {
+	assertLinearScaling(t, "3-table join, mixed ON (equi + filter)", countThreeTableMixedOn)
 }
 
 // assertLinearScaling runs a COUNT query at doubling table sizes and asserts
