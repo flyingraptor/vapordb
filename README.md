@@ -1162,6 +1162,7 @@ Sketch out a data model and queries before committing to a real database schema.
 - **`ILIKE` / `NOT ILIKE`** — case-insensitive `LIKE`; rewritten to `LOWER(x) LIKE LOWER(y)` before parsing. ✓
 - **Streaming persistence** — `db.SaveTo(io.Writer)` / `db.LoadFrom(io.Reader)` persist to and restore from any stream (gzip, HTTP body, `bytes.Buffer`, embedded `fs.FS`), complementing the file-based `Save` / `Load`. ✓
 - **`INSERT … SELECT`** — populate a table from a query in one statement. Source columns map onto the target list positionally and the full SELECT pipeline (`WHERE` / `JOIN` incl. `FULL OUTER JOIN` / `GROUP BY` / `DISTINCT` / `ORDER BY` / `LIMIT` / derived tables / `UNION` / correlated + scalar subqueries) is available. Composes with `ON CONFLICT …`, `RETURNING`, named parameters, and CTEs (`WITH … INSERT … SELECT`). Window functions in the projection are the one unsupported case — compute them in a CTE first. (This work also fixed a latent panic where any `WITH … <DML>` through `db.Exec` unlocked the wrong mutex and deadlocked the database.) ✓
+- **Hash join for equi-joins** — `col = col` joins (single or `AND`-chained) build a hash table on the right input and probe it from the left, so a join of two N-row tables is `O(N)` instead of the previous `O(N²)` nested-loop scan. Applies to every link in a multi-table join chain, and all join types (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER`). Non-equi conditions, cross joins, and key types that need value coercion (dates, JSON, mixed numeric/string families) transparently fall back to the nested loop, so results are identical. ✓
 
 ### Remaining
 
@@ -1183,6 +1184,16 @@ Sketch out a data model and queries before committing to a real database schema.
 - **Multi-table `UPDATE` / `DELETE`** — `UPDATE`/`DELETE` operate on a single table; join-based multi-table updates/deletes are not supported.
 
 ## Changelog
+
+### 2026-07-02
+
+**Performance**
+
+- **Hash join for equi-joins** — joins were previously executed as a nested loop over full-table scans (for every left row, scan every right row and re-evaluate the `ON` condition on a freshly merged row), making the read path `O(N²)` per join and `O(Nᵏ)` for a k-table chain. Any `col = col` join condition (single or `AND`-chained) now builds a hash table on the right input and probes it from the left, reducing each join to `O(N)`. The optimisation applies at every link of a multi-table join chain and to all join types (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER`).
+
+  Correctness is preserved by design: hash keys mirror `Compare`'s equality semantics (the numeric family — `bool`/`int`/`float` — hashes together; `NULL` never matches), and any condition the hash cannot represent identically — non-equality operators, `OR`, function/arithmetic operands, cross joins, or key values that need coercion (`DATE`, `JSON`, or a key position mixing numeric and string values) — transparently falls back to the original nested-loop join.
+
+  Measured on a 3-table `COUNT(*)` over a join chain at 1,600 rows per table: **6.4 s → 7.5 ms (~850×)**, memory **11.4 GB → 3.8 MB**, allocations **30.8M → 37k**. Per-item cost, which previously roughly doubled every time N doubled (the nested-loop signature), is now flat. See `stress_test.go` for the scaling benchmarks and regression guards.
 
 ### 2026-06-26
 

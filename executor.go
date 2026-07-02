@@ -718,6 +718,28 @@ func nullRowLike(rows []Row) Row {
 func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 	rightRows := rowsForRef(db, jd.right, true)
 
+	// Fast path: for an equi-join (ON a = b [AND c = d …]) build a hash table on
+	// the right side and probe it from the left, turning the O(L×R) nested loop
+	// into O(L+R). Falls back to the nested loop for cross joins, non-equi
+	// conditions, empty inputs, or key types the hash cannot represent with the
+	// exact same equality semantics as Compare (dates, JSON, mixed families).
+	if jd.condition != nil && len(leftRows) > 0 && len(rightRows) > 0 {
+		if keys, ok := equiJoinKeys(jd.condition, leftRows[0], rightRows[0], jd.right.alias); ok {
+			if result, done := hashJoin(db, leftRows, rightRows, jd, keys); done {
+				return result, nil
+			}
+		}
+	}
+
+	return nestedLoopJoin(db, leftRows, rightRows, jd)
+}
+
+// nestedLoopJoin is the general join algorithm: for every left row it scans
+// every right row and evaluates the join condition on the merged row. It
+// handles any condition (including non-equi and cross joins) and all join
+// types, at the cost of O(L×R) work. applyJoin uses it as the fallback when the
+// hash join cannot apply.
+func nestedLoopJoin(db *DB, leftRows, rightRows []Row, jd joinDesc) ([]Row, error) {
 	isLeft := strings.Contains(jd.joinType, "left")
 	isRight := strings.Contains(jd.joinType, "right")
 	isFull := jd.joinType == "full join"
@@ -764,6 +786,208 @@ func applyJoin(db *DB, leftRows []Row, jd joinDesc) ([]Row, error) {
 	}
 
 	return result, nil
+}
+
+// joinKeyPair describes one equality in an equi-join condition, split so that
+// `left` is evaluated against left-side rows and `right` against right-side rows.
+type joinKeyPair struct {
+	left  *sqlparser.ColName
+	right *sqlparser.ColName
+}
+
+// equiJoinKeys inspects a join condition and, if it is a plain equi-join
+// (column = column, optionally AND-ed together), returns the key columns with
+// each side oriented to left/right rows. It returns ok=false for anything else
+// (OR, non-equality operators, function/arithmetic operands, or ambiguous
+// column orientation), so the caller falls back to the nested loop.
+func equiJoinKeys(cond sqlparser.Expr, leftSample, rightSample Row, rightAlias string) ([]joinKeyPair, bool) {
+	switch e := cond.(type) {
+	case *sqlparser.ParenExpr:
+		return equiJoinKeys(e.Expr, leftSample, rightSample, rightAlias)
+
+	case *sqlparser.AndExpr:
+		left, ok := equiJoinKeys(e.Left, leftSample, rightSample, rightAlias)
+		if !ok {
+			return nil, false
+		}
+		right, ok := equiJoinKeys(e.Right, leftSample, rightSample, rightAlias)
+		if !ok {
+			return nil, false
+		}
+		return append(left, right...), true
+
+	case *sqlparser.ComparisonExpr:
+		if e.Operator != sqlparser.EqualStr {
+			return nil, false
+		}
+		lcol, lok := e.Left.(*sqlparser.ColName)
+		rcol, rok := e.Right.(*sqlparser.ColName)
+		if !lok || !rok {
+			return nil, false
+		}
+		ls := colSide(lcol, leftSample, rightSample, rightAlias)
+		rs := colSide(rcol, leftSample, rightSample, rightAlias)
+		switch {
+		case ls == sideLeft && rs == sideRight:
+			return []joinKeyPair{{left: lcol, right: rcol}}, true
+		case ls == sideRight && rs == sideLeft:
+			return []joinKeyPair{{left: rcol, right: lcol}}, true
+		default:
+			return nil, false
+		}
+
+	default:
+		return nil, false
+	}
+}
+
+type joinSide int
+
+const (
+	sideAmbiguous joinSide = iota
+	sideLeft
+	sideRight
+)
+
+// colSide decides whether a join-condition column refers to the left or right
+// input. It prefers unambiguous presence in exactly one side's row; when a
+// column resolves on both sides (e.g. a self-join) it disambiguates by matching
+// the column qualifier against the right table's alias.
+func colSide(c *sqlparser.ColName, leftSample, rightSample Row, rightAlias string) joinSide {
+	_, inLeft := resolveColumn(c, leftSample)
+	_, inRight := resolveColumn(c, rightSample)
+	switch {
+	case inRight && !inLeft:
+		return sideRight
+	case inLeft && !inRight:
+		return sideLeft
+	case inLeft && inRight:
+		q := c.Qualifier.Name.String()
+		if q == rightAlias {
+			return sideRight
+		}
+		if q != "" {
+			return sideLeft
+		}
+		return sideAmbiguous
+	default:
+		return sideAmbiguous
+	}
+}
+
+// hashJoin performs an equi-join by hashing the right input and probing from
+// the left. It returns done=false (and a nil result) if it encounters a key
+// value it cannot represent with the same equality semantics as the nested
+// loop (KindDate / KindJSON, or a key position that mixes numeric and string
+// values across rows); the caller then falls back to nestedLoopJoin.
+//
+// Row output order matches the nested loop: left rows in order, each paired
+// with its matching right rows in right-row order, LEFT/FULL null-padding
+// interleaved per left row, and RIGHT/FULL null-padding appended at the end.
+func hashJoin(db *DB, leftRows, rightRows []Row, jd joinDesc, keys []joinKeyPair) ([]Row, bool) {
+	isLeft := strings.Contains(jd.joinType, "left")
+	isRight := strings.Contains(jd.joinType, "right")
+	isFull := jd.joinType == "full join"
+
+	// families[i] records whether key position i has been seen as numeric or
+	// string; a later value of the other family means the two columns can match
+	// under Compare in ways a family-tagged hash key would miss, so we bail.
+	families := make([]keyFamily, len(keys))
+
+	// Build the hash table on the right input.
+	index := make(map[string][]int, len(rightRows))
+	for ri, rr := range rightRows {
+		key, matchable, supported := buildJoinKey(rr, keys, false, families)
+		if !supported {
+			return nil, false
+		}
+		if !matchable {
+			continue // NULL key: never matches (unmatched for RIGHT/FULL padding)
+		}
+		index[key] = append(index[key], ri)
+	}
+
+	var result []Row
+	rightMatched := make([]bool, len(rightRows))
+
+	for _, lr := range leftRows {
+		key, matchable, supported := buildJoinKey(lr, keys, true, families)
+		if !supported {
+			return nil, false
+		}
+		matched := false
+		if matchable {
+			for _, ri := range index[key] {
+				result = append(result, mergeRows(lr, rightRows[ri]))
+				rightMatched[ri] = true
+				matched = true
+			}
+		}
+		if (isLeft || isFull) && !matched {
+			result = append(result, mergeRows(lr, nullRowForTable(db, jd.right)))
+		}
+	}
+
+	if isRight || isFull {
+		nullLeft := nullRowLike(leftRows)
+		for ri, rr := range rightRows {
+			if !rightMatched[ri] {
+				result = append(result, mergeRows(nullLeft, rr))
+			}
+		}
+	}
+
+	return result, true
+}
+
+type keyFamily int8
+
+const (
+	familyUnset keyFamily = iota
+	familyNumeric
+	familyString
+)
+
+// buildJoinKey builds the composite hash key for one row across all key
+// positions. useLeft selects the left or right column of each pair. It returns
+// matchable=false when any key value is NULL (which can never satisfy an
+// equi-join), and supported=false when a value's type cannot be hashed with
+// Compare-identical semantics, signalling the caller to fall back.
+func buildJoinKey(row Row, keys []joinKeyPair, useLeft bool, families []keyFamily) (key string, matchable, supported bool) {
+	var sb strings.Builder
+	for i, kp := range keys {
+		col := kp.right
+		if useLeft {
+			col = kp.left
+		}
+		v, _ := resolveColumn(col, row)
+		switch v.Kind {
+		case KindNull:
+			return "", false, true
+		case KindBool, KindInt, KindFloat:
+			if families[i] == familyString {
+				return "", false, false
+			}
+			families[i] = familyNumeric
+			// Canonical numeric form matches Compare's numeric-family branch,
+			// so int 1, float 1.0, and bool true all hash together.
+			sb.WriteString("n:")
+			sb.WriteString(strconv.FormatFloat(numericFloat(v), 'g', -1, 64))
+		case KindString:
+			if families[i] == familyNumeric {
+				return "", false, false
+			}
+			families[i] = familyString
+			sb.WriteString("s:")
+			sb.WriteString(v.V.(string))
+		default:
+			// KindDate / KindJSON: Compare applies coercions the hash cannot
+			// reproduce; fall back to the nested loop.
+			return "", false, false
+		}
+		sb.WriteByte('\x01')
+	}
+	return sb.String(), true, true
 }
 
 func applyWhere(db *DB, rows []Row, where *sqlparser.Where) ([]Row, error) {
