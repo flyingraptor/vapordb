@@ -30,6 +30,34 @@ import (
 // operators. rewriteFilterAggregates and rewriteOnConflict have enough
 // dedicated machinery that they keep their own files (this one references them).
 
+// containsFold reports whether lowerSubstr (which MUST already be lowercase
+// ASCII) appears anywhere in s under ASCII case-insensitive comparison. It
+// allocates nothing (unlike strings.Contains(strings.ToUpper(s), …)), which
+// matters because it guards hot per-statement rewriters.
+func containsFold(s, lowerSubstr string) bool {
+	m := len(lowerSubstr)
+	if m == 0 {
+		return true
+	}
+	for i := 0; i+m <= len(s); i++ {
+		match := true
+		for j := 0; j < m; j++ {
+			c := s[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != lowerSubstr[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
 // rewritePreParse applies the shared base rewrite chain that every entry point
 // runs before parsing. See the file-level comment for the ordering rationale.
 func rewritePreParse(sql string) string {
@@ -134,6 +162,14 @@ var jsonContainedInRE = regexp.MustCompile(`(?i)(\w+)\s*<@\s*(\w+|'[^']*')`)
 // equivalent json_extract / json_contains function calls that the MySQL-dialect
 // parser understands.
 func rewriteJSONOps(sql string) string {
+	// Fast path: skip the four backtracking-prone regex scans entirely when none
+	// of the JSON shorthand operators are present. These regexes are expensive to
+	// run against a long statement even when they cannot match, and the vast
+	// majority of statements use no JSON operators at all. ("->>" contains "->",
+	// so the single "->" check covers both arrow forms.)
+	if !strings.Contains(sql, "->") && !strings.Contains(sql, "@>") && !strings.Contains(sql, "<@") {
+		return sql
+	}
 	sql = jsonArrowTextRE.ReplaceAllString(sql, "json_unquote(json_extract($1, $2))")
 	sql = jsonArrowRE.ReplaceAllString(sql, "json_extract($1, $2)")
 	sql = jsonContainsAtRE.ReplaceAllString(sql, "json_contains($1, $2)")
@@ -373,6 +409,10 @@ var fullOuterRE = regexp.MustCompile(`(?i)\bFULL\s+(?:OUTER\s+)?JOIN\b`)
 // statement. walkTableExpr maps "straight_join" back to "full join" after
 // parsing so that applyJoin can apply the correct FULL OUTER semantics.
 func rewriteFullOuterJoins(sql string) string {
+	// Fast path: the regex can only match when the keyword FULL is present.
+	if !containsFold(sql, "full") {
+		return sql
+	}
 	return fullOuterRE.ReplaceAllString(sql, "STRAIGHT_JOIN")
 }
 
@@ -391,8 +431,14 @@ var allNeqRE = regexp.MustCompile(`(?i)(<>|!=)\s*ALL\s*\(`)
 //	col <> ALL(…)  →  col NOT IN (…)
 //	col != ALL(…)  →  col NOT IN (…)
 func rewriteAnyAll(sql string) string {
-	sql = anyEqRE.ReplaceAllString(sql, "IN (")
-	sql = allNeqRE.ReplaceAllString(sql, "NOT IN (")
+	// Fast path: each regex can only match when its keyword (ANY / ALL) is
+	// present, so skip the scan when the keyword is absent.
+	if containsFold(sql, "any") {
+		sql = anyEqRE.ReplaceAllString(sql, "IN (")
+	}
+	if containsFold(sql, "all") {
+		sql = allNeqRE.ReplaceAllString(sql, "NOT IN (")
+	}
 	return sql
 }
 

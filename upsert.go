@@ -49,9 +49,19 @@ var excludedRE = regexp.MustCompile(`(?i)EXCLUDED\.(\w+)`)
 // If no ON CONFLICT clause is present the original SQL is returned unchanged
 // with an empty slice and empty upsertWhere.
 func rewriteOnConflict(sql string) (rewritten string, conflictCols []string, doNothing bool, upsertWhere string) {
+	// Fast path: only INSERT … ON CONFLICT statements need this rewrite. Plain
+	// INSERT / UPDATE / DELETE (the common case) skip both backtracking-prone
+	// regexes entirely.
+	if !containsFold(sql, "conflict") {
+		return sql, nil, false, ""
+	}
+
 	// Gap 3: strip the partial-index WHERE predicate (e.g. ON CONFLICT (id) WHERE pred DO …)
-	// before the main regex runs.
-	sql = partialIndexRE.ReplaceAllString(sql, "$1 $2")
+	// before the main regex runs. The predicate always contains WHERE, so skip
+	// this scan for the (common) non-partial ON CONFLICT form.
+	if containsFold(sql, "where") {
+		sql = partialIndexRE.ReplaceAllString(sql, "$1 $2")
+	}
 
 	m := onConflictRE.FindStringSubmatchIndex(sql)
 	if m == nil {
