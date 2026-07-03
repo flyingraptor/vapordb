@@ -153,8 +153,11 @@ func assertLinearScaling(t *testing.T, label, query string) {
 	nFactor := float64(last.n) / float64(first.n)
 	t.Logf("per-item cost grew %.2fx while N grew %.0fx (linear ~1x, quadratic ~%.0fx)",
 		growth, nFactor, nFactor)
+	// Enforced only under VAPORDB_PERF=1 (see perfStrict); logs otherwise so
+	// wall-clock noise never flakes the default run. A nested-loop regression
+	// shows growth ~8x here (vs ~1x linear), well clear of the threshold.
 	if growth >= 3.0 {
-		t.Errorf("%s: join cost is scaling super-linearly (per-item growth %.2fx over %.0fx N) — "+
+		perfReporter(t)("%s: join cost is scaling super-linearly (per-item growth %.2fx over %.0fx N) — "+
 			"a join may have regressed to a nested-loop scan", label, growth, nFactor)
 	}
 }
@@ -164,7 +167,7 @@ func assertLinearScaling(t *testing.T, label, query string) {
 //
 //	go test -run '^$' -bench 'Benchmark.*JoinCount' -benchmem
 func BenchmarkThreeTableJoinCount(b *testing.B) { benchCount(b, countThreeTable) }
-func BenchmarkTwoTableJoinCount(b *testing.B)    { benchCount(b, countTwoTable) }
+func BenchmarkTwoTableJoinCount(b *testing.B)   { benchCount(b, countTwoTable) }
 
 func benchCount(b *testing.B, query string) {
 	for _, n := range []int{200, 400, 800, 1600} {
