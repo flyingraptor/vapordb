@@ -4,7 +4,7 @@ Known limitations and remaining roadmap items. See the [README](README.md) for b
 
 ## Limitations
 
-- No indexes. All queries do a full table scan.
+- No secondary indexes for filtering. A `WHERE` filter (point lookup or range) still scans the whole table; you cannot create an index on a column to speed those up. Two access paths *are* accelerated internally, though: equi-joins (`col = col`, single or `AND`-chained) use a hash join instead of a nested-loop scan (`O(N)` rather than `O(N²)`), and `ON CONFLICT` upsert conflict detection uses a per-table hash index on the conflict-target columns. Both fall back to a linear scan for cases they cannot key (non-equi joins, `DATE`/`JSON` keys, mixed numeric/string families).
 - No foreign key constraints. Model relations with JOINs.
 - MySQL SQL dialect (via `github.com/xwb1989/sqlparser`). Some combinations (for example `LIKE` immediately followed by `||` without parentheses) parse better if you parenthesize the pattern expression. Standard-SQL / PostgreSQL double-quoted identifiers (`"name"`, `"type"`, …) are automatically rewritten to backtick identifiers, and `ILIKE` / `NOT ILIKE` are rewritten to `LOWER(x) LIKE LOWER(y)`, so PostgreSQL-style queries work without changes.
 

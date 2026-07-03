@@ -83,8 +83,8 @@ columns or wider types arrive — there is no `CREATE TABLE` and no migration. S
 | `db.UnlockTable(name)` | Thaw a single table's schema |
 
 A `Row` is `map[string]Value`. Each `Value` has:
-- `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, `time.Time`, or `nil`)
-- `.Kind` is one of `KindNull`, `KindBool`, `KindInt`, `KindFloat`, `KindString`, `KindDate`
+- `.V` is the underlying Go value (`int64`, `float64`, `string`, `bool`, `time.Time`, JSON as `map[string]any` / `[]any`, or `nil`)
+- `.Kind` is one of `KindNull`, `KindBool`, `KindInt`, `KindFloat`, `KindString`, `KindDate`, `KindJSON`
 
 ## Declaring a target database (optional)
 

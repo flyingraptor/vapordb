@@ -847,7 +847,7 @@ all non-soft-delete cases.
 | `DeclareEnum()` | ✅ value-set constraint | `CHECK` / `ENUM` type |
 | `GenerateDDL("postgres")` | ✅ emits `CREATE TABLE` DDL | migration files |
 | Persistence | ❌ in-memory only | ✅ |
-| Indexes / foreign keys | ❌ full table scan | ✅ |
+| Indexes / foreign keys | ❌ no user indexes/FKs; `WHERE` full-scans (joins & upserts use internal hashing) | ✅ |
 
 ---
 
