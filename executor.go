@@ -365,9 +365,12 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 				}
 			}
 			// Apply ON DUPLICATE KEY UPDATE assignments.
-			if err := applyOnDup(db, tbl.Rows[idx], row, stmt.OnDup); err != nil {
+			changed, err := applyOnDup(db, tbl.Rows[idx], row, stmt.OnDup)
+			if err != nil {
 				return err
 			}
+			// Drop only the indexes whose key columns the update touched.
+			tbl.invalidateConflictIdxForCols(changed)
 			// Re-validate after the update assignments.
 			if err := validateEnum(tbl, tbl.Rows[idx]); err != nil {
 				return err
@@ -393,6 +396,7 @@ func execInsert(db *DB, stmt *sqlparser.Insert, conflictCols []string, doNothing
 			}
 		}
 		tbl.Rows = append(tbl.Rows, row)
+		tbl.indexAppendRow(len(tbl.Rows)-1, row)
 		if affectedRowIdx != nil {
 			*affectedRowIdx = append(*affectedRowIdx, len(tbl.Rows)-1)
 		}
@@ -540,10 +544,18 @@ func selectOutputColumns(sel sqlparser.SelectStatement) ([]string, error) {
 
 // findConflict returns the index of the first row in tbl whose values for all
 // conflictCols match the incoming row, or -1 if no conflict exists.
+//
+// It uses a cached conflict-key index (O(1) lookup) when the key values are
+// encodable, falling back to a linear scan for Date / JSON keys so the match
+// semantics remain identical to a direct value comparison.
 func findConflict(tbl *Table, conflictCols []string, incoming Row) int {
 	if tbl == nil {
 		return -1
 	}
+	if idx, used := tbl.lookupConflict(conflictCols, incoming); used {
+		return idx
+	}
+	// Fallback: linear scan (non-encodable key values, e.g. Date / JSON).
 	for i, existing := range tbl.Rows {
 		match := true
 		for _, col := range conflictCols {
@@ -563,7 +575,11 @@ func findConflict(tbl *Table, conflictCols []string, incoming Row) int {
 // parsed INSERT statement. Each assignment is either VALUES(col) — meaning
 // "use the value from the incoming row" — or any other expression evaluated
 // against the incoming row as context.
-func applyOnDup(db *DB, target Row, incoming Row, onDup sqlparser.OnDup) error {
+// applyOnDup updates target in place and returns the names of the columns it
+// wrote, so the caller can invalidate only the conflict indexes those columns
+// participate in (indexes on untouched columns stay valid).
+func applyOnDup(db *DB, target Row, incoming Row, onDup sqlparser.OnDup) ([]string, error) {
+	changed := make([]string, 0, len(onDup))
 	for _, upd := range onDup {
 		colName := upd.Name.Name.Lowered()
 		var newVal Value
@@ -581,12 +597,13 @@ func applyOnDup(db *DB, target Row, incoming Row, onDup sqlparser.OnDup) error {
 			var err error
 			newVal, err = evalExpr(db, expr, incoming)
 			if err != nil {
-				return fmt.Errorf("ON CONFLICT update expr for %q: %w", colName, err)
+				return nil, fmt.Errorf("ON CONFLICT update expr for %q: %w", colName, err)
 			}
 		}
 		target[colName] = newVal
+		changed = append(changed, colName)
 	}
-	return nil
+	return changed, nil
 }
 
 // evalUpsertWhere parses a bare SQL predicate string and evaluates it against
@@ -1661,6 +1678,9 @@ func execUpdate(db *DB, stmt *sqlparser.Update) error {
 	if tbl == nil {
 		return nil
 	}
+	// UPDATE can change any column value; drop cached conflict indexes so a
+	// later upsert rebuilds them from the mutated rows.
+	tbl.invalidateConflictIdx()
 
 	for i, row := range tbl.Rows {
 		if stmt.Where != nil {
@@ -1715,6 +1735,8 @@ func execDelete(db *DB, stmt *sqlparser.Delete) error {
 	if tbl == nil {
 		return nil
 	}
+	// DELETE removes rows and shifts indices; drop cached conflict indexes.
+	tbl.invalidateConflictIdx()
 
 	if stmt.Where == nil {
 		tbl.Rows = make([]Row, 0)

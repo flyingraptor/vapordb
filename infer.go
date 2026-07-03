@@ -62,6 +62,7 @@ func UpsertSchema(db *DB, tableName string, row Row, forceWipeOnSchemaConflict b
 			}
 			// Legacy: wipe the whole table and adopt the new type.
 			tbl.Rows = make([]Row, 0)
+			tbl.invalidateConflictIdx()
 			wiped = true
 			tbl.Schema[col] = incoming
 		case incoming > existing:

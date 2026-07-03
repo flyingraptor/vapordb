@@ -9,4 +9,12 @@ type Table struct {
 	EnumSets map[string][]string `json:"enum_sets,omitempty"` // col → allowed values
 	Locked   bool                `json:"locked,omitempty"`    // true → schema is frozen
 	Rows     []Row               `json:"rows"`
+
+	// conflictIdx caches conflict-key → first-matching-row-index maps, keyed by
+	// the conflict-column signature (see index.go). It turns ON CONFLICT upsert
+	// detection from an O(N) full-table scan per row into an O(1) lookup. It is
+	// maintained incrementally on append and invalidated on any other row
+	// mutation (update / delete / schema wipe). Unexported → never serialized,
+	// and always safe to drop and rebuild lazily.
+	conflictIdx map[string]*conflictIndex
 }
