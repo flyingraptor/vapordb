@@ -1163,6 +1163,7 @@ Sketch out a data model and queries before committing to a real database schema.
 - **Streaming persistence** — `db.SaveTo(io.Writer)` / `db.LoadFrom(io.Reader)` persist to and restore from any stream (gzip, HTTP body, `bytes.Buffer`, embedded `fs.FS`), complementing the file-based `Save` / `Load`. ✓
 - **`INSERT … SELECT`** — populate a table from a query in one statement. Source columns map onto the target list positionally and the full SELECT pipeline (`WHERE` / `JOIN` incl. `FULL OUTER JOIN` / `GROUP BY` / `DISTINCT` / `ORDER BY` / `LIMIT` / derived tables / `UNION` / correlated + scalar subqueries) is available. Composes with `ON CONFLICT …`, `RETURNING`, named parameters, and CTEs (`WITH … INSERT … SELECT`). Window functions in the projection are the one unsupported case — compute them in a CTE first. (This work also fixed a latent panic where any `WITH … <DML>` through `db.Exec` unlocked the wrong mutex and deadlocked the database.) ✓
 - **Hash join for equi-joins** — `col = col` joins (single or `AND`-chained) build a hash table on the right input and probe it from the left, so a join of two N-row tables is `O(N)` instead of the previous `O(N²)` nested-loop scan. Applies to every link in a multi-table join chain, and all join types (`INNER` / `LEFT` / `RIGHT` / `FULL OUTER`). Mixed `ON` conditions (equi term + extra filter such as `… AND b.deleted_at IS NULL`) are split into a hash key plus a residual predicate applied to matched candidates, staying `O(N)` while preserving outer-join null-padding. Purely non-equi conditions, cross joins, and key types that need value coercion (dates, JSON, mixed numeric/string families) transparently fall back to the nested loop, so results are identical. ✓
+- **Conflict-key index for upserts** — `ON CONFLICT` conflict detection uses a per-table hash index on the conflict-target columns (`conflict-key → row`) instead of scanning the whole table for every row, so a bulk upsert import is `O(N)` instead of `O(N²)`. The index is maintained incrementally on insert and invalidated precisely on `UPDATE` / `DELETE` / schema wipe (and only for overlapping columns after an `ON CONFLICT DO UPDATE`). Key encoding matches the engine's value equality (`NULL` matches `NULL`; `int 1` ≠ `float 1.0`); `DATE` / `JSON` keys fall back to the linear scan, so results are unchanged. ✓
 
 ### Remaining
 
@@ -1184,6 +1185,20 @@ Sketch out a data model and queries before committing to a real database schema.
 - **Multi-table `UPDATE` / `DELETE`** — `UPDATE`/`DELETE` operate on a single table; join-based multi-table updates/deletes are not supported.
 
 ## Changelog
+
+### 2026-07-03
+
+**Performance**
+
+- **Conflict-key index for upserts** — `ON CONFLICT` conflict detection previously scanned the entire table for every incoming row (`findConflict` compared each existing row against the new one), making a bulk upsert import `O(N²)`. Conflict detection now uses a per-table hash index keyed on the conflict-target columns (`conflict-key → first matching row`), so each lookup is `O(1)` and an import is `O(N)`.
+
+  The index is maintained incrementally as rows are appended and invalidated precisely by other mutations: dropped wholesale on `UPDATE`, `DELETE`, and forced schema wipe, and — after an `ON CONFLICT DO UPDATE` — dropped only for the indexes whose columns the update actually touched (so updating a non-key column leaves the index intact). Transactions are safe because `Begin`'s snapshot and `Load` produce fresh tables whose index is rebuilt lazily.
+
+  Correctness is preserved by design: the key encoding mirrors the engine's existing value equality (kind-tagged, so `int 1` and `float 1.0` stay distinct; two `NULL`s match), and key types that cannot be encoded identically (`DATE`, `JSON`) transparently fall back to the original linear scan.
+
+  Measured on a batched upsert import (1000 rows/commit): per-item cost, which previously rose with N (~71 µs → ~285 µs from 1k to 8k rows), is now flat (~46–72 µs) and stays within ~2× of a plain insert. See `conflict_index_test.go` for correctness coverage (delete / update / rollback / composite / NULL / date / bool / float cases) and `insert_stress_test.go` for the scaling guard that fails if upserts regress to a linear scan.
+
+  **Note for write-heavy imports:** `Begin` snapshots the whole database, so committing once per row is separately `O(N²)`. Wrap bulk imports in a single transaction (or commit in batches) — batching plus this index makes an upsert import linear end to end.
 
 ### 2026-07-02
 
