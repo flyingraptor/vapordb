@@ -7,7 +7,9 @@ import (
 )
 
 // GenerateDDL inspects the live schema and emits a CREATE TABLE script for
-// every table in the database. dialect must be "mysql" or "postgres".
+// every table in the database. dialect must be "mysql" or "postgres". As a
+// convenience, an empty dialect ("") uses the target declared via [WithTarget]
+// (an error is returned if no target was declared).
 //
 // Columns are emitted in alphabetical order. Enum-constrained columns are
 // rendered as ENUM(…) in MySQL and as TEXT with a CHECK constraint in Postgres.
@@ -17,6 +19,13 @@ func (db *DB) GenerateDDL(dialect string) (string, error) {
 	defer db.mu.RUnlock()
 
 	d := strings.ToLower(strings.TrimSpace(dialect))
+	if d == "" {
+		if td, ok := db.target.ddlDialect(); ok {
+			d = td
+		} else {
+			return "", fmt.Errorf("vapordb: GenerateDDL needs a dialect (\"mysql\" or \"postgres\") or a target declared via WithTarget")
+		}
+	}
 	if d != "mysql" && d != "postgres" {
 		return "", fmt.Errorf("vapordb: unsupported DDL dialect %q; supported: mysql, postgres", dialect)
 	}

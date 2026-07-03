@@ -1188,6 +1188,18 @@ Sketch out a data model and queries before committing to a real database schema.
 
 ### 2026-07-03
 
+**Added**
+
+- **Declare a target database (`WithTarget`)** — a prototype in vapordb is usually thrown away and re-created in a real database once the model stabilises. You can now declare that target up front so vapordb keeps you honest along the way:
+
+  ```go
+  db := vapordb.New(vapordb.WithTarget(vapordb.TargetPostgres))
+  ```
+
+  With a target set (other than the default `TargetGeneric`), every `Query` / `Exec` (and the named variants) is checked for SQL that would **not** port cleanly to that database, and each issue is recorded as a `PortabilityWarning` (retrievable via `db.PortabilityWarnings()`, or streamed live through `WithPortabilityWarner`). Examples: a `TargetPostgres` database warns on backtick identifiers, `ON DUPLICATE KEY UPDATE`, `IFNULL()`, `RLIKE`/`REGEXP`, and `LIMIT offset, count`; a `TargetMySQL` database warns on double-quoted identifiers, `ON CONFLICT`, `ILIKE`, `::` casts, `@>`/`<@`, `= ANY`/`<> ALL`, `NULLS FIRST/LAST`, and `RETURNING`. Keywords inside string literals never trigger a warning.
+
+  As a convenience, `db.GenerateDDL("")` (empty dialect) now uses the declared target's dialect. This is a **warn-only lint** — it never changes execution or results, and the permissive prototyping core (schema inference, type widening) is untouched. The default remains `TargetGeneric`, so existing code is unaffected.
+
 **Performance**
 
 - **Conflict-key index for upserts** — `ON CONFLICT` conflict detection previously scanned the entire table for every incoming row (`findConflict` compared each existing row against the new one), making a bulk upsert import `O(N²)`. Conflict detection now uses a per-table hash index keyed on the conflict-target columns (`conflict-key → first matching row`), so each lookup is `O(1)` and an import is `O(N)`.

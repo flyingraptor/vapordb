@@ -26,6 +26,14 @@ type DB struct {
 	// introduce an incompatible column type: wipe all rows and adopt the new
 	// type. By default (false) such inserts return an error instead.
 	forceWipeOnSchemaConflict bool
+
+	// target is the real database the user intends to migrate to. When not
+	// TargetGeneric, Query/Exec lint statements for non-portable SQL and
+	// GenerateDDL can default to the target's dialect. See target.go.
+	target     Target
+	portWarner func(PortabilityWarning)
+	warnMu     sync.Mutex
+	warnings   []PortabilityWarning
 }
 
 // Option configures a [DB] created with [New].
@@ -199,6 +207,8 @@ func (db *DB) Query(sql string, opts ...WriteOption) (rows []Row, retErr error) 
 		appendQueryLog(logPath, "query", sql, len(rows), time.Since(start), retErr)
 	}()
 
+	db.recordPortabilityWarnings(sql)
+
 	forceWipe := effectiveForceWipeOnSchemaConflict(db, opts)
 	target, mainSQL, cteNames, err := resolveCTEs(db, sql, forceWipe)
 	if err != nil {
@@ -293,6 +303,8 @@ func (db *DB) Exec(sql string, opts ...WriteOption) (retErr error) {
 		db.mu.Unlock()
 		appendQueryLog(logPath, "exec", sql, 0, time.Since(start), retErr)
 	}()
+
+	db.recordPortabilityWarnings(sql)
 
 	forceWipe := effectiveForceWipeOnSchemaConflict(db, opts)
 	// resolveCTEs may return a temporary DB (target) augmented with CTE tables.
