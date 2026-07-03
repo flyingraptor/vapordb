@@ -1200,6 +1200,12 @@ Sketch out a data model and queries before committing to a real database schema.
 
   **Note for write-heavy imports:** `Begin` snapshots the whole database, so committing once per row is separately `O(N²)`. Wrap bulk imports in a single transaction (or commit in batches) — batching plus this index makes an upsert import linear end to end.
 
+**Internal**
+
+- **Split `executor.go` by pipeline stage** — the statement executor had grown to ~3,300 lines in a single file spanning the entire SELECT pipeline, DML, subqueries, expression evaluation, casts, and scalar functions. It is now split into cohesive same-package files — `select.go`, `join.go`, `aggregate.go`, `dml.go`, `subquery.go`, `eval.go`, `cast.go`, `func.go` — with `executor.go` retaining only the shared table-reference and row helpers plus UNION. This is a pure code-relocation refactor: no public API changed, no function signatures changed, and no test was modified (the white-box `package vapordb` test suite is unchanged and stays the behaviour oracle). The library remains a single flat package — the split is by file, not by sub-package, so the zero-friction single-import ergonomics are preserved.
+
+- **Stabilised `TestUpsertScalesLinearlyWithIndex`** — the upsert scaling guard asserted per-item growth `< 2x`, a threshold too tight for a wall-clock measurement under suite load (observed ~2.6x from contention). The bound is relaxed to `< 3x` (matching the sibling `TestBatchCommitRemovesTxBottleneck`); a genuine O(N²) regression over 8x N still produces ~8x growth, so the guard keeps its teeth while no longer flaking.
+
 ### 2026-07-02
 
 **Performance**

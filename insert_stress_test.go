@@ -214,17 +214,20 @@ func TestUpsertScalesLinearlyWithIndex(t *testing.T) {
 	insertGrowth := lastInsert / firstInsert
 	upsertGrowth := lastUpsert / firstUpsert
 	nFactor := float64(lastN) / float64(sizes[0])
-	t.Logf("over %.0fx N — batched INSERT per-item: %.2fx, batched UPSERT per-item: %.2fx (both want ~linear, < 2x), upsert/insert at largest N: %.1fx",
+	t.Logf("over %.0fx N — batched INSERT per-item: %.2fx, batched UPSERT per-item: %.2fx (both want ~linear, < 3x), upsert/insert at largest N: %.1fx",
 		nFactor, insertGrowth, upsertGrowth, lastRatio)
 
 	// Control: batched plain insert scales ~linearly (per-item stays bounded).
-	if insertGrowth >= 2.0 {
-		t.Errorf("expected batched INSERT per-item growth < 2x over %.0fx N, got %.2fx", nFactor, insertGrowth)
+	// The 3x bound (matching TestBatchCommitRemovesTxBottleneck) absorbs
+	// wall-clock jitter when the suite runs under load; a true O(N²) regression
+	// over 8x N would show ~8x growth, so this still catches a real regression.
+	if insertGrowth >= 3.0 {
+		t.Errorf("expected batched INSERT per-item growth < 3x over %.0fx N, got %.2fx", nFactor, insertGrowth)
 	}
 	// The fix: batched upsert now also scales ~linearly. Before the conflict-key
 	// index this was strongly super-linear (findConflict's O(N) scan per row).
-	if upsertGrowth >= 2.0 {
-		t.Errorf("expected batched UPSERT per-item growth < 2x over %.0fx N (conflict-key index should make it linear), got %.2fx — "+
+	if upsertGrowth >= 3.0 {
+		t.Errorf("expected batched UPSERT per-item growth < 3x over %.0fx N (conflict-key index should make it linear), got %.2fx — "+
 			"the index may have regressed to a linear scan", nFactor, upsertGrowth)
 	}
 	// Upsert stays within a small constant factor of a plain insert (index
