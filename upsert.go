@@ -5,26 +5,6 @@ import (
 	"strings"
 )
 
-// ── = ANY(…) / <> ALL(…) rewriter ────────────────────────────────────────────
-
-// anyEqRE matches  = ANY(  (case-insensitive) and replaces it with  IN (
-var anyEqRE = regexp.MustCompile(`(?i)=\s*ANY\s*\(`)
-
-// allNeqRE matches  <> ALL(  or  != ALL(  and replaces with  NOT IN (
-var allNeqRE = regexp.MustCompile(`(?i)(<>|!=)\s*ALL\s*\(`)
-
-// rewriteAnyAll rewrites PostgreSQL-style set operators to standard IN / NOT IN
-// so the MySQL-dialect parser can handle them:
-//
-//	col = ANY(…)   →  col IN (…)
-//	col <> ALL(…)  →  col NOT IN (…)
-//	col != ALL(…)  →  col NOT IN (…)
-func rewriteAnyAll(sql string) string {
-	sql = anyEqRE.ReplaceAllString(sql, "IN (")
-	sql = allNeqRE.ReplaceAllString(sql, "NOT IN (")
-	return sql
-}
-
 // partialIndexRE matches the optional "WHERE pred" between ON CONFLICT (…) and DO.
 // This is the partial-index predicate form (e.g. ON CONFLICT (id) WHERE deleted_at IS NULL DO …).
 // vapordb strips the predicate before further processing because it treats every
@@ -121,7 +101,7 @@ func findTrailingWHERE(s string) int {
 	n := len(s)
 	for i < n {
 		if s[i] == '\'' {
-			i = fSkipQuote(s, i) // reuse helper from rewrite_filter.go
+			i = fSkipQuote(s, i) // reuse helper from rewrite.go
 			continue
 		}
 		if i+5 <= n && strings.EqualFold(s[i:i+5], "WHERE") {
