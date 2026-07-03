@@ -1,0 +1,31 @@
+name: Verify (Docker)
+
+# Docker-backed portability validation for the nested `verify` module: proves
+# that GenerateDDL + a corpus of vapordb-accepted SQL run on real PostgreSQL and
+# MySQL. Kept separate from the core unit-test job (ci.yml) because it requires
+# Docker and pulls heavy dependencies that never touch the core module.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  verify:
+    name: DDL + corpus on real databases
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: verify/go.mod
+          cache-dependency-path: verify/go.sum
+
+      # ubuntu-latest runners ship with a working Docker daemon, which
+      # testcontainers-go uses directly.
+      - name: Run verify module
+        working-directory: verify
+        run: go test -count=1 -v ./...
