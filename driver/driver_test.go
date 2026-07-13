@@ -3,6 +3,7 @@ package driver_test
 import (
 	"database/sql"
 	"testing"
+	"time"
 
 	vapordriver "github.com/flyingraptor/vapordb/driver"
 
@@ -83,6 +84,51 @@ func TestDriverQMarkParams(t *testing.T) {
 	}
 	if name != "Widget" {
 		t.Errorf("want Widget, got %q", name)
+	}
+}
+
+// ── time.Time parameters preserve time-of-day ───────────────────────────────────
+
+// TestDriverTimeParamPreservesTimeOfDay guards against truncating a time.Time
+// parameter to date granularity. Two rows are written on the SAME calendar day
+// but at different times of day, then filtered with a cutoff whose time-of-day
+// sits between them. Only the later row must match. If the driver rendered
+// time.Time as DATE('...') (midnight), both stored values and the cutoff would
+// collapse to the same date and the filter would return both rows.
+func TestDriverTimeParamPreservesTimeOfDay(t *testing.T) {
+	db, _ := newSQLDB(t)
+
+	early := time.Date(2024, 3, 15, 9, 0, 0, 0, time.UTC)
+	late := time.Date(2024, 3, 15, 15, 30, 0, 0, time.UTC)
+	cutoff := time.Date(2024, 3, 15, 12, 0, 0, 0, time.UTC)
+
+	if _, err := db.Exec(`INSERT INTO events (id, ts) VALUES (?, ?)`, 1, early); err != nil {
+		t.Fatalf("Exec insert early: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO events (id, ts) VALUES (?, ?)`, 2, late); err != nil {
+		t.Fatalf("Exec insert late: %v", err)
+	}
+
+	rows, err := db.Query(`SELECT id FROM events WHERE ts >= ? ORDER BY id`, cutoff)
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	defer rows.Close()
+
+	var got []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("cutoff at 12:00 must match only the 15:30 row; want [2], got %v", got)
 	}
 }
 

@@ -374,7 +374,14 @@ func driverValueToSQL(v sqld.Value) string {
 		if x.IsZero() {
 			return "NULL"
 		}
-		return fmt.Sprintf("DATE('%s')", x.UTC().Format("2006-01-02 15:04:05"))
+		// Emit DATETIME when a time-of-day component is present so the
+		// value is not truncated to midnight; use DATE only for pure dates.
+		// Mirrors the rendering logic in mapping.go.
+		u := x.UTC()
+		if u.Hour() != 0 || u.Minute() != 0 || u.Second() != 0 || u.Nanosecond() != 0 {
+			return fmt.Sprintf("DATETIME('%s')", u.Format("2006-01-02 15:04:05"))
+		}
+		return fmt.Sprintf("DATE('%s')", u.Format("2006-01-02"))
 	default:
 		return "'" + strings.ReplaceAll(fmt.Sprintf("%v", x), "'", "''") + "'"
 	}
